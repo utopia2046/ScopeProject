@@ -1,0 +1,290 @@
+﻿//Script GUID:a7275bf5-1390-408e-bf0e-acfc9b4ef675
+//Used for tracking history
+#DECLARE StartDateTime DateTime = DateTime.Parse("2022-01-12");
+#DECLARE EndDateTime DateTime = @StartDateTime.AddDays(1);
+#DECLARE DateFormat string = @"yyyy-MM-dd";
+#DECLARE LogDateString string = @StartDateTime.ToString(@DateFormat);
+
+#DECLARE NumberLine string = @"AdsFLN4";
+#DECLARE EnUS string = "en-US";
+#DECLARE TreatmentFlt int = 145705;
+#DECLARE ControlFlt int = 145754;
+
+#DECLARE Outpath string = String.Format("/local/AdsOI/SERP/SLAPI/{0}/{1:D2}", @StartDateTime.Year, @StartDateTime.Month);
+#DECLARE LogDate string = @StartDateTime.ToString("yyyy-MM-dd");
+
+SearchLogPageView = 
+    VIEW "/shares/searchDM/distrib/released/SLAPI/SearchLogPageView.view" 
+    PARAMS 
+    (    Start = @StartDateTime.ToString(@DateFormat),
+         End = @EndDateTime.ToString(@DateFormat),
+         Dataset = "Bing.com",
+         ReturnAbnormalTraffic = false,
+         UseSample = false
+    );
+
+MergedLogs = SELECT
+        RGUID,
+        Request_ImpressionGuid AS ImpressionGuid,
+        Request_FrontDoorImpressionEventId AS TraceId,
+        Request_RequestTime AS RequestTime,
+        Request_OSInfo.ProductName AS OS,
+        Request_Browser AS Browser,
+        Query_RawQuery AS Query,
+        FormCode,
+        DataSources,
+        Utils.SLAPIGetAdsFlightId(DataSources.FindElementsWithProperty("T", "D.Top.AdsDomain.AdCenter")[0].GetDataPropertyOrDefault("AdsFlights", "").ToLower(), @NumberLine) AS FlightId,
+        Metrics_Overall_PLT AS OverallPLT,
+        Metrics_AppServer_InternalLatency AS AppServerInternalLatency,
+        Metrics_AppServer_FederationLatency AS AppServerFederationLatency,
+        Metrics_AppServer_TotalLatency AS AppServerTotalLatency
+        //Metrics_ATLA_AdServiceLatency AS AdServiceLatency,
+        //Metrics_ATLA_WebAnswerLatency AS WebAnswerLatency,
+        //Metrics_FrontDoor_TotalLatency AS FrontDoorTotalLatency,
+        //Metrics_FrontDoor_InternalLatency AS FrontDoorInternalLatency,
+        //Metrics_FrontDoor_FederationLatency AS FrontDoorFederationLatency
+    FROM SearchLogPageView
+    WHERE Query_IsNormal
+          AND Request_IsNormalTraffic
+          //AND !User_HasMsIp
+          AND !Request_IsBotVNext
+          AND Market == @EnUS
+          AND Vertical == "web"
+          AND Page_Name == "Page.Serp"
+    HAVING FlightId == @TreatmentFlt OR FlightId == @ControlFlt;
+
+//TimeScope = SELECT
+//    MIN(RequestTime) AS MinTime,
+//    MAX(RequestTime) AS MaxTime
+//FROM MergedLogs;
+
+//#DECLARE OutputTimeScope string = String.Format("{0}/ExpSale_TimeScope_{1}.ss", @Outpath, @LogDateString);
+//OUTPUT TimeScope TO SSTREAM @OutputTimeScope WITH STREAMEXPIRY "90";
+
+SLAPIData =
+    PROCESS MergedLogs
+    USING SlapiPADecorParser();
+
+#DECLARE SLAPIDataOutput string = String.Format("{0}/ExpSale_All_{1}.ss", @Outpath, @LogDateString);
+OUTPUT SLAPIData TO SSTREAM @SLAPIDataOutput CLUSTERED BY RequestTime SORTED BY RequestTime WITH STREAMEXPIRY "90";
+
+Ads = SELECT
+        DISTINCT RGUID, ImpressionGuid, PagePosition, AdId, ListingId, OfferId64,
+        FlightId,
+        HasSaleExt,
+        HasSaleBadge
+    FROM SLAPIData;
+
+AdImpression = SELECT
+        COUNT(*) AS TotalAds,
+        COUNTIF(FlightId == @TreatmentFlt) AS TrmtAds,
+        COUNTIF(FlightId == @ControlFlt) AS CtrlAds,
+        COUNTIF(HasSaleExt) AS HasSaleCnt,
+        COUNTIF(HasSaleBadge) AS HasSaleBadgeCnt,
+        COUNTIF(FlightId == @TreatmentFlt AND HasSaleExt) AS TrmtHasSaleCnt,
+        COUNTIF(FlightId == @TreatmentFlt AND HasSaleExt AND HasSaleBadge) AS TrmtHasSaleBadgeCnt
+    FROM Ads;
+
+#DECLARE OutputAdImpression string = String.Format("{0}/ExpSale_Impressions_{1}.ss", @Outpath, @LogDateString);
+OUTPUT AdImpression TO SSTREAM @OutputAdImpression WITH STREAMEXPIRY "90";
+
+Treatment = SELECT *
+    FROM SLAPIData
+    WHERE FlightId == @TreatmentFlt
+      AND HasSaleExt OR HasSaleBadge;
+
+#DECLARE OutputTrmt string = String.Format("{0}/ExpSale_Treatment_{1}.ss", @Outpath, @LogDateString);
+OUTPUT Treatment TO SSTREAM @OutputTrmt WITH STREAMEXPIRY "90";
+
+Control = SELECT *
+    FROM SLAPIData
+    WHERE FlightId == @ControlFlt
+      AND HasSaleExt OR HasSaleBadge;
+
+#DECLARE OutputCtrl string = String.Format("{0}/ExpSale_Control_{1}.ss", @Outpath, @LogDateString);
+OUTPUT Control TO SSTREAM @OutputCtrl WITH STREAMEXPIRY "90";
+
+// ------------------------------------------------------------------------------------------------------
+
+#CS
+using Microsoft.SCOPE.Types;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using ScopeRuntime;
+
+public static class Utils
+{
+    private const char start = '\uE000';
+    private const char end = '\uE001';
+
+    public static int SafeParserInt(string intStr)
+    {
+        if (string.IsNullOrEmpty(intStr))
+        {
+            return 0;
+        }
+        else
+        {
+            return int.Parse(intStr);
+        }
+    }
+
+    public static int SLAPIGetAdsFlightId(string intStr, string FlightLine)
+    {
+        if (string.IsNullOrEmpty(intStr))
+        {
+            return 0;
+        }
+ 
+        var result = intStr.Split('|');
+        foreach (var flightId in result)
+        {
+            var item = flightId.Split(':');
+            if (item.Length == 2 && item[0] == FlightLine.ToLower())
+            {
+                return SafeParserInt(item[1]);
+            }
+        }
+        return 0;
+    }
+}
+
+public class SlapiPADecorParser : Processor
+{
+    public override Schema Produces(string[] requestedColumns, string[] args, Schema input)
+    {
+        var result = new Schema(new[] {
+            // Request columns
+            "RGUID",
+            "ImpressionGuid",
+            "TraceId",
+            "RequestTime",
+            "OS",
+            "Browser",
+            "Query",
+            "FormCode",
+            "FlightId:int",
+
+            // Metrics columns
+            "OverallPLT:long",
+            "AppServerInternalLatency:long",
+            "AppServerFederationLatency:long",
+            "AppServerTotalLatency:long",
+            //"AdServiceLatency:long",
+            //"WebAnswerLatency:long",
+            //"FrontDoorTotalLatency:long",
+            //"FrontDoorInternalLatency:long",
+            //"FrontDoorFederationLatency:long",
+
+            // Ad columns
+            "PagePosition",
+            "AdId:ulong",
+            "ListingId:ulong",
+            "OfferId64:ulong",
+            "Seller",
+
+            // Decoration Columns
+            "HasSaleExt:bool",
+            "HasSaleBadge:bool"
+        });
+
+        return result;
+    }
+
+    public override IEnumerable<Row> Process(RowSet input, Row output, string[] args)
+    {
+        foreach (Row row in input.Rows)
+        {
+            DataSourceList dataSources = row["DataSources"].Value as DataSourceList;
+            string rguid = dataSources.FindElementsWithProperty("T", "D.Top.AdsDomain.AdCenter")[0].GetDataPropertyOrDefault("RequestId", "");
+
+            // Set common columns
+            output["RGUID"].Set(rguid.ToUpper());
+            output["ImpressionGuid"].Set(row["ImpressionGuid"].String.ToUpper());
+            output["TraceId"].Set(row["TraceId"].String.ToUpper());
+            output["RequestTime"].Set(row["RequestTime"].String);
+            output["OS"].Set(row["OS"].String);
+            output["Browser"].Set(row["Browser"].String);
+            output["Query"].Set(row["Query"].String);
+            output["FormCode"].Set(row["FormCode"].String);
+            output["FlightId"].Set(row["FlightId"].Integer);
+
+            // Set performance columns
+            output["OverallPLT"].Set(row["OverallPLT"].Long);
+            output["AppServerInternalLatency"].Set(row["AppServerInternalLatency"].Long);
+            output["AppServerFederationLatency"].Set(row["AppServerFederationLatency"].Long);
+            output["AppServerTotalLatency"].Set(row["AppServerTotalLatency"].Long);
+            //output["AdServiceLatency"].Set(row["AdServiceLatency"].Long);
+            //output["WebAnswerLatency"].Set(row["WebAnswerLatency"].Long);
+            //output["FrontDoorTotalLatency"].Set(row["FrontDoorTotalLatency"].Long);
+            //output["FrontDoorInternalLatency"].Set(row["FrontDoorInternalLatency"].Long);
+            //output["FrontDoorFederationLatency"].Set(row["FrontDoorFederationLatency"].Long);
+
+            var adElemML = dataSources.FindElementsWithProperty("Position", "Crest").FindElementsWithProperty("AdType", "ProductListingAd");
+            var adElemSB = dataSources.FindElementsWithProperty("Position", "Flank").FindElementsWithProperty("AdType", "ProductListingAd");
+            var adElemPole = dataSources.FindElementsWithProperty("Position", "Pole").FindElementsWithProperty("AdType", "ProductListingAd");
+            var adElemMoP = dataSources.FindElementsWithProperty("Position", "Middle").FindElementsWithProperty("AdType", "ProductListingAd");
+
+            if (adElemML.Count > 0)
+            {
+                foreach (var item in ProcessAdPosition(adElemML, "ML", output))
+                {
+                    yield return item;
+                }
+            }
+            if (adElemSB.Count > 0)
+            {
+                foreach (var item in ProcessAdPosition(adElemSB, "SB", output))
+                {
+                    yield return item;
+                }
+            }
+            if (adElemPole.Count > 0)
+            {
+                foreach (var item in ProcessAdPosition(adElemPole, "PO", output))
+                {
+                    yield return item;
+                }
+            }
+            if (adElemMoP.Count > 0)
+            {
+                foreach (var item in ProcessAdPosition(adElemMoP, "MD", output))
+                {
+                    yield return item;
+                }
+            }
+        }
+    }
+
+    private IEnumerable<Row> ProcessAdPosition(DataSourceList adList, string Position, Row output)
+    {
+        for (int adNum = 0; adNum < adList.Count; adNum++)
+        {
+            var ad = adList[adNum];
+            FillAdColumns(ad, Position, adNum, output);
+            FillDecorationColumns(ad, output);
+            yield return output;
+        }
+    }
+
+    private void FillAdColumns(DataSourceElement adElem, string PagePositionPrefix, int adNum, Row output)
+    {
+        // Fill up impression columns
+        output["PagePosition"].Set(PagePositionPrefix + (adNum + 1).ToString());
+        output["AdId"].Set(Convert.ToUInt64(adElem.GetDataPropertyOrDefault("AdId", "0")));
+        output["ListingId"].Set(Convert.ToUInt64(adElem.GetDataPropertyOrDefault("ListingId", "0")));
+        output["OfferId64"].Set(Convert.ToUInt64(adElem.GetDataPropertyOrDefault("OfferId64", "0")));
+        output["Seller"].Set(adElem.GetDataPropertyOrDefault("DisplayUrl", ""));
+    }
+
+    private void FillDecorationColumns(DataSourceElement adElem, Row output)
+    {
+        var saleExt = adElem.FindElementsWithProperty("T", "D.Ad.SaleExtension").Count;
+        output["HasSaleExt"].Set(saleExt > 0);
+        var saleBadge = adElem.FindElementsWithProperty("T", "D.Ad.SaleBadgeExtension").Count;
+        output["HasSaleBadge"].Set(saleBadge > 0);
+    }
+}
+#ENDCS

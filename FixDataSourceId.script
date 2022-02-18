@@ -1,0 +1,125 @@
+﻿//Script GUID:419c5f36-c60d-4c44-a1af-de2c94611b02
+//Used for tracking history
+#DECLARE StartDateTimeUtc DateTime = DateTime.Parse(@@startDateTime@@);
+#DECLARE EndDateTimeUtc DateTime = @StartDateTimeUtc.AddDays(1);
+
+#DECLARE LogDate DateTime = @StartDateTimeUtc;
+#DECLARE LogDateString string = @LogDate.ToString("yyyy-MM-dd");
+
+#DECLARE Outpath string = String.Format("/local/AdsOI/SERP/Reliability/{0}/{1:D2}", @LogDate.Year, @LogDate.Month);
+
+#DECLARE In_MVData string = String.Format("{0}/MV_Decorations_{1}.ss", @Outpath, @LogDateString);
+#DECLARE In_SLAPIData string = String.Format("{0}/SLAPI_Decorations_{1}.ss", @Outpath, @LogDateString);
+
+InputMVData =
+    SSTREAM @In_MVData;
+
+MVImpressions =
+    SELECT AdExtensionTypeId,
+           SUM(ImpressionCnt) AS Imps
+    FROM InputMVData
+    GROUP BY AdExtensionTypeId;
+
+InputSLAPIData =
+    SSTREAM @In_SLAPIData;
+
+SLAPIDistinct =
+    SELECT DISTINCT RGUID,
+                    Request_ImpressionGuid,
+                    PagePosition,
+                    AdId,
+                    ListingId,
+                    OfferId64,
+                    Utils.GetDecorTypeIdFromDataSrceId(DecorDataSourceId) AS DecorTypeId,
+                    DecorDataSourceId
+    FROM InputSLAPIData
+    WHERE DecorDataSourceId != 0;
+
+#DECLARE Out_SLAPIData string = String.Format("{0}/SLAPI_Decorations_Updated_{1}.ss", @Outpath, @LogDateString);
+OUTPUT SLAPIDistinct TO SSTREAM @Out_SLAPIData WITH STREAMEXPIRY "90";
+
+SLAPIImpressions =
+    SELECT SLAPIDistinct.DecorTypeId AS DecorTypeId,
+           COUNT( * ) AS Imps
+    FROM SLAPIDistinct
+         INNER JOIN
+             InputMVData
+         ON
+             SLAPIDistinct.RGUID == InputMVData.RGUID AND
+             SLAPIDistinct.Request_ImpressionGuid == InputMVData.SearchIG AND
+             SLAPIDistinct.PagePosition == InputMVData.PagePosition AND
+             SLAPIDistinct.AdId == InputMVData.AdId AND
+             SLAPIDistinct.ListingId == InputMVData.ListingId AND
+             SLAPIDistinct.OfferId64 == InputMVData.OfferId64 AND
+             SLAPIDistinct.DecorTypeId == InputMVData.AdExtensionTypeId
+    GROUP BY DecorTypeId;
+
+ExtensionCompare =
+    SELECT
+        @LogDate AS Date,
+        MVImpressions.AdExtensionTypeId AS AdExtensionTypeId,
+        Utils.MapAdExtensionTypeIdToString(MVImpressions.AdExtensionTypeId) AS AdExtensionType,
+        MVImpressions.Imps AS MVImps,
+        SLAPIImpressions.Imps AS SLAPIImps,
+        (MVImpressions.Imps - SLAPIImpressions.Imps) * 1.0 / MVImpressions.Imps * 100 AS Gap
+    FROM MVImpressions
+        INNER JOIN SLAPIImpressions ON MVImpressions.AdExtensionTypeId == SLAPIImpressions.DecorTypeId;
+
+#DECLARE Out_Compare string = String.Format("{0}/DecorationsCompare_Updated_{1}.ss", @Outpath, @LogDateString);
+OUTPUT ExtensionCompare TO SSTREAM @Out_Compare WITH STREAMEXPIRY "180";
+
+#CS
+using Microsoft.SCOPE.Types;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using ScopeRuntime;
+
+public static class Utils
+{
+    public enum DecorationTypes
+    {
+        None = 0,
+        MerchantPromotion = 52,
+        LocalInventoryExtension = 56,
+        ConditionAnnotation = 16135,
+        EliteBadge = 16250,
+        PriceDropAlert = 16251,
+        ProductRating = 16252,
+        FreeShipping = 16253,
+        SmartCategory = 16027,
+        AttributeAnnotation = 16260,
+        AttributeAnnotationDatasource = 16261,
+        TopVisitedAnnotation = 16262,
+        TopVisitedAnnotationDatasource = 16263,
+        PAVisitedLinksAnnotation = 16264,
+        PAVisitedLinksAnnotationDatasource = 16265,
+        PriceDropAlertBadge = 16268,
+        FreeReturnsDatasource = 16269,
+        FreeReturns = 16270,
+        SaleBadge = 16271,
+        SaleExtension = 16272,
+        AddToCart = 16277,
+    }
+
+    public static string MapAdExtensionTypeIdToString(int typeId)
+    {
+        var enumValue = (DecorationTypes)typeId;
+        return enumValue.ToString();
+    }
+
+    public static int GetDecorTypeIdFromDataSrceId(int dataSrceId)
+    {
+        switch ((DecorationTypes)dataSrceId)
+        {
+            case DecorationTypes.AttributeAnnotationDatasource:
+                return (int)DecorationTypes.AttributeAnnotation;
+            case DecorationTypes.TopVisitedAnnotationDatasource:
+                return (int)DecorationTypes.TopVisitedAnnotation;
+            default:
+                return (int)dataSrceId;
+        }
+    }
+}
+#ENDCS

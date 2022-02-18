@@ -1,0 +1,904 @@
+﻿//Script GUID:93221421-e11c-4500-9656-9df3c25b1136
+//Used for tracking history
+
+#DECLARE ScopeUtilDll string = @"/shares/bingads.algo.adsplus/AdsPlusDataShare/Team/Resources/AdPredictor.ScopeUtils.dll";
+USING Microsoft.AdPredictor.ScopeUtils REFERENCE @ScopeUtilDll;
+
+#DECLARE StartDateTimeUtc DateTime = DateTime.Parse(@@startDateTime@@);
+#DECLARE EndDateTimeUtc DateTime = @StartDateTimeUtc.AddDays(1);
+#DECLARE StartDateTimePst DateTime = @StartDateTimeUtc.AddHours(-8);
+#DECLARE EndDateTimePst DateTime = @EndDateTimeUtc.AddHours(-8);
+#DECLARE LogDate DateTime = @StartDateTimeUtc.AddDays(1);
+#DECLARE LogDateString string = @LogDate.ToString("yyyy-MM-dd");
+
+#DECLARE FltNumberLine string = @"AdsFLN4";
+#DECLARE FlightId int = 31172;
+#DECLARE Market string = "en-US";
+
+#DECLARE Outpath string = String.Format("/local/AdsOI/SERP/Reliability/{0}/{1:D2}", @LogDate.Year, @LogDate.Month);
+
+#DECLARE Out_MonetizationPAData string = String.Format("{0}/MV_Decorations_{1}.ss", @Outpath, @LogDateString);
+#DECLARE Out_SLAPIData string = String.Format("{0}/SLAPI_Decorations_{1}.ss", @Outpath, @LogDateString);
+#DECLARE Out_Extension_CompareResult string = String.Format("{0}/DecorationsCompare_{1}.ss", @Outpath, @LogDateString);
+
+MonetizationView = VIEW "/shares/adCenter.BICore.SubjectArea/SubjectArea/Monetization/views/PROD/MonetizationFacts.view"
+    PARAMS
+    (
+        StartDateTimeUtc = @StartDateTimeUtc,
+        EndDateTimeUtc = @EndDateTimeUtc,
+        LoadDlls = true,
+        UnpivotAdExtensionItem = false,
+        UnpivotAdExtension = true,
+        UnpivotAdElement = false,
+        ReadClicks = false,
+        ReadAdImpressions = true,
+        ReadPageViews = false
+    );
+
+MonetizationOriginalData =
+    SELECT RGUID,
+           PagePosition,
+           SearchEventId,
+           SearchFormId,
+           SearchIG,
+           RootSearchIG,
+           SearchImpressionGuid,
+           SearchInputMethod,
+           SearchSessionId,
+           SearchSiteVersionId,
+           AdUnitId,
+           PublisherAccountId,
+           PublisherId,
+           PublisherOwnerId,
+           MarketplaceClassificationId,
+           MarketplaceClassificationName,
+           AdvertiserAccountId,
+           AnonymousId,
+           CampaignId,
+           (ulong?) AdId AS AdId,
+           (ulong?) OrderItemId AS ListingId,
+           (ulong?) OfferId64 AS OfferId64,
+           AdDisplayTypeId,
+           AdExtensionTypeId,
+           AdExtensionId,
+           AdExtensionItemId,
+           AdExtensionRenderedLayoutId,
+           AdExtensionItemRenderedLayoutId,
+           ImpressionCnt,
+           IsFraud,
+           Utils.MVGetFlightNum(FlightInfoRecordList, @FltNumberLine) AS FlightNum,
+           IF(string.IsNullOrEmpty(AdLanguage) || string.IsNullOrEmpty(WebsiteCountry), null, AdLanguage + "-" + WebsiteCountry) AS Market
+    FROM MonetizationView;
+
+MonetizationPAData =
+    SELECT *
+    FROM MonetizationOriginalData
+    WHERE
+    ALL(
+        IsFraud == false,
+        AdDisplayTypeId == 5,
+        AdExtensionTypeId != 0,
+        MarketplaceClassificationId == 1, // Bing.com exclude Bing.com/images
+        FlightNum == ("" + @FlightId),
+        !string.IsNullOrEmpty(Market) AND Market.Equals(@Market.ToLower(), StringComparison.OrdinalIgnoreCase),
+        PagePosition.StartsWith("ML") OR PagePosition.StartsWith("SB") OR PagePosition.StartsWith("PO") OR PagePosition.StartsWith("MD")
+    );
+
+MonetizationPADistinctData =
+    SELECT DISTINCT RGUID,
+                    SearchIG,
+                    PagePosition,
+                    AdId,
+                    ListingId,
+                    OfferId64,
+                    AdExtensionTypeId,
+                    ImpressionCnt
+    FROM MonetizationPAData;
+
+OUTPUT MonetizationPADistinctData TO SSTREAM @Out_MonetizationPAData CLUSTERED BY RGUID SORTED BY RGUID WITH STREAMEXPIRY "90";
+
+MonetizationPAImpsData =
+    SELECT (int?) AdExtensionTypeId AS AdExtensionTypeId,
+           SUM(ImpressionCnt) AS Imps
+    FROM MonetizationPADistinctData
+    GROUP BY AdExtensionTypeId;
+
+SearchLogPageView =
+    VIEW "/shares/searchDM/distrib/released/SLAPI/SearchLogPageView.view"
+    PARAMS
+    (
+        Start = @StartDateTimePst.ToString("yyyy-MM-dd"),
+        End = @EndDateTimeUtc.ToString("yyyy-MM-dd"), // EndDateTimeUtc for a more wide time range
+        Dataset = "Bing.com,BingAtWork,BingInClassroom",
+        ReturnAbnormalTraffic = true,
+        UseSample = false
+    );
+
+MergedLogs =
+    SELECT RGUID,
+           ClientId,
+           Request_ImpressionGuid,
+           Request_FrontDoorImpressionEventId.ToLower() AS FrontDoorIG,
+           Query_RawQuery.Trim().ToLower() AS RawQuery,
+           Request_Cookies["MUID"].Value AS MUID,
+           Market,
+           Vertical,
+           Request_OSInfo.ProductName AS OS,
+           Metrics_DwellTime,
+           DataSources,
+           Utils.SLAPIGetAdsFlightId(DataSources.FindElementsWithProperty("T", "D.Top.AdsDomain.AdCenter") [0].GetDataPropertyOrDefault("AdsFlights", "").ToLower(), @FltNumberLine) AS FlightId
+    FROM SearchLogPageView
+    WHERE Query_IsNormal
+          AND Market == @Market
+          AND Vertical == "web"
+          AND Page_Name == "Page.Serp"
+    HAVING FlightId == @FlightId;
+
+SLAPIData =
+    PROCESS MergedLogs
+    USING SlapiPADecorParser();
+
+OUTPUT SLAPIData TO SSTREAM @Out_SLAPIData CLUSTERED BY RGUID SORTED BY RGUID WITH STREAMEXPIRY "90";
+
+PASLAPIDistinctData =
+    SELECT DISTINCT RGUID,
+                    Request_ImpressionGuid,
+                    PagePosition,
+                    AdId,
+                    ListingId,
+                    OfferId64,
+                    DecorTypeId,
+                    DecorDataSourceId
+    FROM SLAPIData
+    WHERE DecorDataSourceId != 0;
+
+PASLAPIImpressions =
+    SELECT PASLAPIDistinctData.DecorTypeId AS DecorTypeId,
+           COUNT( * ) AS Imps
+    FROM PASLAPIDistinctData
+         INNER JOIN
+             MonetizationPADistinctData
+         ON
+         ALL(
+             PASLAPIDistinctData.RGUID == MonetizationPADistinctData.RGUID,
+             PASLAPIDistinctData.Request_ImpressionGuid == MonetizationPADistinctData.SearchIG,
+             PASLAPIDistinctData.PagePosition == MonetizationPADistinctData.PagePosition,
+             PASLAPIDistinctData.AdId == MonetizationPADistinctData.AdId,
+             PASLAPIDistinctData.ListingId == MonetizationPADistinctData.ListingId,
+             PASLAPIDistinctData.OfferId64 == MonetizationPADistinctData.OfferId64,
+             PASLAPIDistinctData.DecorTypeId == MonetizationPADistinctData.AdExtensionTypeId
+         )
+    GROUP BY DecorTypeId;
+
+Extension_CompareResult =
+    SELECT
+        @LogDate AS Date,
+        MonetizationPAImpsData.AdExtensionTypeId AS AdExtensionTypeId,
+        Utils.MapAdExtensionTypeIdToString(MonetizationPAImpsData.AdExtensionTypeId) AS AdExtensionType,
+        MonetizationPAImpsData.Imps AS MVImps,
+        PASLAPIImpressions.Imps AS SLAPIImps,
+        (MonetizationPAImpsData.Imps - PASLAPIImpressions.Imps) * 1.0 / MonetizationPAImpsData.Imps * 100 AS Gap
+    FROM MonetizationPAImpsData
+        INNER JOIN PASLAPIImpressions ON MonetizationPAImpsData.AdExtensionTypeId == PASLAPIImpressions.DecorTypeId;
+
+OUTPUT Extension_CompareResult TO SSTREAM @Out_Extension_CompareResult WITH STREAMEXPIRY "180";
+
+#CS
+using Microsoft.SCOPE.Types;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using ScopeRuntime;
+
+public static class Utils
+{
+    private const char start = '\uE000';
+    private const char end = '\uE001';
+    private const string Delimiter = "\t";
+
+    public enum DecorationTypes
+    {
+        None = 0,
+
+        // MerchantRatings = 1 [In BI, MR islogged as 1], OfficialSites = 2 [Old UX Id, do not reuse], HotelRatings = 3 [Old UX Id, do not reuse], TopAd = 4 [Old UX Id, do not reuse],
+        SiteLinkExtension = 10,
+        LocationExtension = 11,
+        CallExtension = 12,
+        ProductExtension = 13,
+        MeteredCallExtension = 14,
+        MerchantRatings = 15,
+        DescriptionLAT = 16,
+        DisplayUrlLAT = 17,
+        LocalLAT = 18,
+        DescriptionAndURLLAT = 19,
+        OriginalLAT = 20,
+        DynamicLAT = 21,
+        OfficialSiteLAT = 22,
+        SnapshotAnnotation = 23,
+        EntityPeekRichAnnotation = 24,
+        SmartAnnotation = 25,
+        OfficialSiteBadge = 27,
+        AdCreativeAnnotation = 30,
+        SocialAdExtension = 34,
+        ImageAdExtension = 35,
+        EnhancedSitelinks = 36,
+        ProductCatalog = 37,
+        AppExtension = 38,
+        ReviewExtension = 39,
+        ActionsExtension = 40,
+        FormExtension = 41,
+        CalloutExtension = 42,
+        BlackBoxWarningExtension = 43,
+        DisclosureExtension = 44,
+        TableExtension = 45,
+        VideoExtension = 46,
+        SocialExtension = 47,
+        TabExtension = 48,
+        DynamicProductExtension = 50,
+        StructuredSnippetExtension = 51,
+        MerchantPromotion = 52,
+        FilterLinkExtension = 53,
+        FlyerExtension = 54,
+        PriceExtension = 55,
+        LocalInventoryExtension = 56,
+        PromotionExtension = 57,
+        AffiliateLocationExtension = 58,
+        DynamicDataExtension = 59,
+        AutomatedFilterLink = 16119,
+        FilterLinkBackfill = 16108,
+        SLAB = 16001,
+        Twitter = 16002,
+        DUDE = 16003,
+        TopAds = 16004,
+        FaviconAnnotations = 16005,
+        MerchantRatingLAT = 16006,
+        LandingPageTitleLAT = 16007,
+        DomainURLLAT = 16008,
+        LocationLAT = 16009,
+        SiteLinkOptimization = 16010,
+        SmartLandingPageTitle = 16011,
+        ConsumerRating = 16012,
+
+        // Personalization is DEPRECATED. Please don't use it anywhere.
+        Personalization = 16013,
+        PreviousVisit = 16013,
+        ClickToCallLAT = 16015,
+        ThirdPartyUserPersonalization = 16016,
+        VisitedLinks = 16017,
+        FourthLine = 16018,
+        Brand = 16019,
+        LPPhrasesLAT = 16021,
+        QueryLAT = 16022,
+        RelatedProducts = 16023,
+        LPPhraseLATV2 = 16024,
+        ConsumerSentiment = 16025,
+        PopOutAnnotation = 16026,
+        SmartCategory = 16027,
+        PersonalizedRecommendation = 16029,
+        EntityDescriptionAnnotation = 16030,
+        QueryLATV2 = 16031,
+        LongDescription = 16032,
+        DynamicDescription = 16034,
+        DescriptionFactLAT = 16035,
+        SmartLandingPageList = 16036,
+        BrandLAT = 16037,
+        ESLLAT = 16038,
+        KeywordLAT = 16039,
+        AutomatedImageExtension = 16040,
+        BrandLogo = 16041,
+        ImageDataSourceFromMSAN = 16042,
+        BrandAnnotationAsLAT = 16044,
+        ESLBackFill = 16046,
+        Badge = 16050,
+        SecurityBadge = 16051,
+        LandingPageMetaKWLAT = 16052,
+        BingSnippetAnnotation =16053,
+        ActionsExtensionFromAdsLab = 16054,
+        CalloutLAT = 16055,
+        DynamicProductExtensionFromAdslab = 16056,
+        DynamicProductExtensionPersonalized = 16057,
+        CategoryBadge=16058,
+        SiteSearchAnnotation=16059,
+        BingNextActionAnnotation=16060,
+        ChatExtension = 16062,
+        DescriptionSummaryLAT = 16063,
+        FilterLink = 16064,
+        FilterLinkFromAdslab = 16065,
+        DescriptionShuffleLAT = 16066,
+        PopularQueryLAT = 16067,
+        LongDescriptionTwoLine = 16068,
+        FormAnnotation = 16069,
+        BingPlaces = 16070,
+        LocationExtensionGetARide = 16072,
+        DomainKeywordLAT = 16073,
+        DomainCalloutLAT = 16074,
+        FlyerFromPA = 16075,
+        DynamicTitle = 16076,
+        ExtensionLATOptOut = 16077,
+        HotelRating = 16078,
+        MetaDescriptionAnnotation = 16079,
+        MobileFriendlyAnnotation = 16080,
+        CalloutExtensionFromAdsLab = 16081,
+        DynamicCalloutAnnotation = 16082,
+        DescriptionSummaryDisplayUrlLAT = 16083,
+        PromotionAnnotation = 16084,
+        HighCTRSnippetAnnotation = 16086,
+        EventAnnotation = 16087,
+        HighPrecisionLPSnippet = 16088,
+        CustomerServiceCallAnnotation = 16089,
+        StellaReviewBackfill = 16090,
+        ReviewExtensionFromAdsLab = 16091,
+        DynamicMapLocations = 16092,
+        BoldedAdTitle = 16094,
+        AutomatedDynamicProductExtension = 16095,
+        ChatBotAnnotation = 16097,
+        AffiliateStoreLocations = 16098,
+        PromotionExtensionFromAdsLab = 16099,
+        AutomatedPromotionExtension = 16100,
+        ExTATitle1 = 16101,
+        ExTATitle2 = 16102,
+        DealBadge = 16103,
+        ShippingBadge = 16105,
+        AffiliateLocationExtensionFromAdsLab = 16106,
+        VerticalAdsMetadata = 16109,
+        AddressLAT = 16110,
+        AdslabFlyerExtensionFromCreative = 16111,
+        AdslabActionExtensionFromCreative = 16112,
+        CoAccountLAT = 16113,
+        PriceLAT = 16114,
+        AppInstallCategory = 16115,
+        AppInstallPrice = 16116,
+        AppInstallRating = 16117,
+        DescriptionOverride = 16118,
+        DynamicPromotionExtension = 16120,
+        PASmartCategory  = 16121,
+        DynamicPriceExtension = 16122,
+        PriceAnnotationTours = 16123,
+        DynamicAppInstallCategory = 16125,
+        DynamicAppInstallPrice = 16126,
+        DynamicAppInstallRating = 16127,
+        HttpsUXFeature = 16128,
+        AdTitle3 = 16129,
+        AdDescription1 = 16130,
+        AdDescription2 = 16131,
+        TourActivityAdsMetadata = 16132,
+        DealsAnnotation = 16133,
+        PABadge = 16134,
+        ConditionAnnotation = 16135,
+        DynamicDataBackfill = 16136,
+        AutomatedDynamicDataExtension = 16137,
+        OfficialSiteAnnotation = 16138,
+        PremiumCustomer = 16139,
+        DealsBadge = 16140,
+        CountryOfOriginBadge = 16141,
+        ActionLinkBackfill = 16142,
+        DealsActionLinkBackfill = 16143,
+        DeepGenLAT = 16144,
+        FilterLinksFromBreadcrumb = 16145,
+        TitleSeparator = 16146,
+        SyndicationAnnotation = 16147,
+        DisplayUrlOverride = 16148,
+        TitleOverride = 16149,
+        AutoAdsMetadata = 16150,
+        LocalBusinessAdsMetadata = 16151,
+        DisplayUrlSuffix = 16153,
+        DynamicDataAccommodations = 16154,
+        StorePickupBadge = 16155,
+        PickupDeliveryLAT = 16156,
+        CoCampaignDesc = 16157,
+        DDEBackfillFromHPA = 16158,
+        LPExtractorPlusLAT = 16160,
+        PersonalizedBrandLAT = 16162,
+        FacebookBadge = 16163,
+        TitleAsset = 16164,
+        DescriptionAsset = 16165,
+        TitleOptions = 16166,
+        DescriptionOptions = 16167,
+        DefaultAdCopy  = 16168,
+        BSAActionBackfill = 16169,
+        CreditCardAdsMetadata = 16170,
+        DynamicSocialExtension = 16171,
+        SocialAwarenessBadge = 16172,
+        BusinessAttributes = 16173,
+        WhiteGloveCampaigns = 16200,
+        WhiteGlovePersonalizedOffers = 16201,
+        WhiteGlovePersonalizedOffersTableOutput = 16202,
+        TableExtensionTestInput = 16204,
+        HotelAnnotation = 16205,
+        TableExtensionFeedMetata = 16206,
+        DynamicTableExtension = 16207,
+        RichAdsPersonalizationMetadata = 16208,
+        OfferExtension = 16210,
+        TrendingSearch = 16211,
+        ESLGenericText = 16212,
+        SloganAnnotation = 16213,
+        PersonalizedLAT = 16215,
+        HotelAmenities = 16216,
+        DSAFilterlinkBackfill = 16217,
+        EliteBadge = 16250,
+        PriceDropAlert = 16251,
+        ProductRating = 16252,
+        FreeShipping = 16253,
+        ThreeDimensionalProductAds = 16254,
+        PAOfficialSiteAnnotation = 16255,
+        HPAOfficialSiteAnnotation = 16256,
+        BrandLoyalty = 16257,
+        HPAPriceDrop = 16258,
+        FirstPAPromotion = 16259,
+        AttributeAnnotation = 16260,
+        AttributeAnnotationDatasource = 16261,
+        TopVisitedAnnotation = 16262,
+        TopVisitedAnnotationDatasource = 16263,
+        PAVisitedLinksAnnotation = 16264,
+        PAVisitedLinksAnnotationDatasource = 16265,
+        PriceDropAlertBadge = 16268,
+        FreeReturnsDatasource = 16269,
+        FreeReturns = 16270,
+        SaleBadge = 16271,
+        SaleExtension = 16272,
+        PAShortTitle = 16273,
+        PAShortTitleDataSource = 16274,
+        PAImageAnnotation = 16275,
+        PAImageAnnotationDataSource = 16276,
+        AddToCart = 16277,
+        PABusinessAttributes = 16278,
+        PABrandLogo = 16279,
+        PABrandLogoDataSource = 16280,
+        BestLATDomain = 16298,
+        BestLATAdListing = 16299,
+        EntityPaneMap = 16301,
+
+        // DecorationTypes used to represent media asset types
+        AssetLandscapeImageMedia = 16400,
+        AssetSquareImageMedia = 16401,
+        AssetLandscapeLogoMedia = 16402,
+        AssetSquareLogoMedia = 16403,
+        AssetImageMedia169X100 = 16404,
+        AssetImageMedia93X100 = 16405,
+        AssetImageMedia15X10 = 16406,
+        AssetImageMedia155X100 = 16407,
+        AssetImageMedia133X100 = 16408,
+        AssetImageMedia178X100 = 16409,
+        AssetImageMedia172X100 = 16410,
+        AssetImageMedia1X2 = 16411,
+        AssetImageMedia4X1 = 16412,
+        AssetResponsiveAdHeadlines = 16413,
+        AssetResponsiveAdLongHeadlines = 16414,
+        AssetResponsiveAdDescriptions = 16415,
+        AssetMMACallToAction = 16416,
+
+        // This decoration type represents the dummy extension generated for
+        // cash back scenario (similar to media asset types above)
+        AdvertiserPromotion = 16450,
+
+        // GetARideInLocationExtension and FilterLink are DEPRECATED. Please don't use it anywhere.
+        GetARideInLocationExtension=16702,
+
+        // Used to indicate to UX which types are not opted out by advertiser
+        UXExperiment = 18000,
+
+        // Used to opt-out ThinAds Experience
+        ThinAd = 19000,
+    };
+
+    public static string MapAdExtensionTypeIdToString(int? AdExtensionTypeId)
+    {
+        return $"{(DecorationTypes)AdExtensionTypeId}";
+    }
+
+    public static string GetSignature(params string[] args)
+    {
+        return string.Join(Delimiter, args).GetHashCode().ToString();
+    }
+
+    public static int SafeParserInt(string intStr)
+    {
+        if (string.IsNullOrEmpty(intStr))
+        {
+            return 0;
+        }
+        else
+        {
+            return int.Parse(intStr);
+        }
+    }
+
+    public static int SLAPIGetAdsFlightId(string intStr, string FlightLine)
+    {
+        if (string.IsNullOrEmpty(intStr))
+        {
+            return 0;
+        }
+
+        var result = intStr.Split('|');
+        foreach (var flightId in result)
+        {
+            var item = flightId.Split(':');
+            if (item.Length == 2 && item[0] == FlightLine.ToLower())
+            {
+                return SafeParserInt(item[1]);
+            }
+        }
+        return 0;
+    }
+
+    public static string Unbold(string str)
+    {
+        if (string.IsNullOrEmpty(str))
+        {
+            return string.Empty;
+        }
+        var sb = new StringBuilder();
+        foreach (var c in str)
+        {
+            if (c == start || c == end) continue;
+            sb.Append(c);
+        }
+        return sb.ToString();
+    }
+
+    public static string MVGetFlightNum(String flightInfo, String fligthLine)
+    {
+        if (String.IsNullOrEmpty(flightInfo))
+            return String.Empty;
+        //split the string to different flight lines
+        String[] flights = flightInfo.Split(';');
+        if (flights == null || flights.Length == 0)
+            return String.Empty;
+        foreach (String flight in flights)
+        {
+            String[] infos = flight.Split('|');
+            if (infos == null || infos.Length != 4)
+                continue;
+            //AdsFLN7
+            if (infos[0].Equals(fligthLine, StringComparison.InvariantCultureIgnoreCase))
+            {
+                //return the flight Id
+                return infos[1];
+            }
+        }
+        return String.Empty;
+    }
+}
+
+
+public class DecorItemInfo
+{
+    public string text;
+    public string url;
+    public bool isClickable;
+    public bool isBillable;
+    public string desc1;
+    public string desc2;
+    public int decorItemClicks;
+
+}
+
+public class DecorationInfo
+{
+    public List<DecorItemInfo> items; //could be only 1 item
+    public string decType;
+    public string layout;
+    public int height;
+    public int width;
+    public int lineCount;
+    public DecorDataSrceId dataSrceId;
+    public string position; //RightFloated (such as: image, video ,button etc.)
+
+    public int quickBackClicks;
+
+    public static int MAX_ITEM_COUNT = 6;
+    public enum DecorDataSrceId
+    {
+        None = 0,
+        ConditionAnnotation = 16135,
+        PriceDropAlert = 16251,
+        ProductRating = 16252,
+        FreeShipping = 16253,
+        SmartCategory = 16027,
+        AttributeAnnotation = 16260,
+        AttributeAnnotationDatasource = 16261,
+        TopVisitedAnnotation = 16262,
+        TopVisitedAnnotationDatasource = 16263,
+        PAVisitedLinksAnnotation = 16264,
+        PAVisitedLinksAnnotationDatasource = 16265,
+        PriceDropAlertBadge = 16268,
+        FreeReturnsDatasource = 16269,
+        FreeReturns = 16270,
+        SaleBadge = 16271,
+        SaleExtension = 16272,
+    }
+
+}
+
+public class SlapiPADecorParser : Processor
+{
+    public static int MAX_ITEM_COUNT = 6;
+    public void InitOutput(Row output)
+    {
+        int firstIdx = output.Schema.IndexOf("DecorType");
+
+        for (int ColIdx = firstIdx; ColIdx < output.Schema.Count; ColIdx++)
+        {
+            if (output.Schema[ColIdx].Type == ColumnDataType.Integer)
+            {
+                output[ColIdx].Set(0);
+            }
+            else
+            {
+                output[ColIdx].Set("");
+            }
+        }
+    }
+
+    public override Schema Produces(string[] requestedColumns, string[] args, Schema input)
+    {
+        var result = new Schema(new[] {
+             // Common columns
+            "RGUID",
+            "ClientId",
+            "RawQuery",
+            "Request_ImpressionGuid",
+            "FrontDoorIG",
+            "MUID",
+            "Market",
+            "Vertical",
+            "OS",
+            "PageDwellTime:double?",
+
+             // Impression columns
+                "PagePosition",
+                "OriginalPosition",
+                "AdId:ulong",
+                "ListingId:ulong",
+                "OfferId",
+                "OfferId64:ulong",
+                "Seller",
+                "ProductImageUrl",
+                "Title",
+                "AdClicks",
+                "ImprDwellTime:float?",
+
+            //Decoration info. Columns
+                "DecorType",
+                "DecorTypeId:int",
+                "DecorDataSourceId:int",
+                "DecorClicks:int",
+                "DecorQBClicks:int"
+
+            });
+        return result;
+    }
+
+    public override IEnumerable<Row> Process(RowSet input, Row output, string[] args)
+    {
+        foreach (Row row in input.Rows)
+        {
+            DataSourceList dataSources = row["DataSources"].Value as DataSourceList;
+            string rguid = dataSources.FindElementsWithProperty("T", "D.Top.AdsDomain.AdCenter")[0].GetDataPropertyOrDefault("RequestId", "");
+
+            // Set common columns
+
+            output["RGUID"].Set(rguid.ToLower());
+            output["ClientId"].Set(row["ClientId"].String.ToLower());
+            output["FrontDoorIG"].Set(row["FrontDoorIG"].String.ToLower());
+            output["Request_ImpressionGuid"].Set(row["Request_ImpressionGuid"].String.ToLower());
+            output["RawQuery"].Set(row["RawQuery"].String);
+            output["MUID"].Set(row["MUID"].String);
+            output["Market"].Set(row["Market"].String);
+            output["Vertical"].Set(row["Vertical"].String);
+
+            output["OS"].Set(row["OS"].String);
+            output["PageDwellTime"].Set(row["Metrics_DwellTime"].DoubleQ);
+
+            //ML
+            var adElemML = dataSources.FindElementsWithProperty("Position", "Crest").FindElementsWithProperty("AdType", "ProductListingAd");
+            var adElemSB = dataSources.FindElementsWithProperty("Position", "Flank").FindElementsWithProperty("AdType", "ProductListingAd");
+            var adElemPole = dataSources.FindElementsWithProperty("Position", "Pole").FindElementsWithProperty("AdType", "ProductListingAd");
+            var adElemMoP = dataSources.FindElementsWithProperty("Position", "Middle").FindElementsWithProperty("AdType", "ProductListingAd");
+
+            // "Crest", "Flank", "Pole",  "Middle"
+            //    var PAList = dataSources.FindElementsWithProperty(MS.Internal.Bing.DataMining.SearchLogApi.FilterSettings.Or, MS.Internal.Bing.DataMining.SearchLogApi.Helpers.StringToKvp("Position", "Crest", "Position", "Flank", "Position", "Pole", "Position", "Middle")).FindElementsWithProperty("AdType", "ProductListingAd");
+            if (adElemML.Count > 0)
+            {
+                foreach (var item in ProcessAdPosition(adElemML, "ML", output))
+                {
+                    yield return item;
+                }
+            }
+            if (adElemSB.Count > 0)
+            {
+                foreach (var item in ProcessAdPosition(adElemSB, "SB", output))
+                {
+                    yield return item;
+                }
+            }
+            if (adElemPole.Count > 0)
+            {
+                foreach (var item in ProcessAdPosition(adElemPole, "PO", output))
+                {
+                    yield return item;
+                }
+            }
+            if (adElemMoP.Count > 0)
+            {
+                foreach (var item in ProcessAdPosition(adElemMoP, "MD", output))
+                {
+                    yield return item;
+                }
+            }
+        }
+    }
+
+    private IEnumerable<Row> ProcessAdPosition(DataSourceList adList, string Position, Row output)
+    {
+        for (int adNum = 0; adNum < adList.Count; adNum++)
+        {
+            var ad = adList[adNum];
+            FillImpressionColumns(ad, Position, adNum, output);
+
+            //parse the decorations for 1 ad
+            List<DecorationInfo> decorResult = new List<DecorationInfo>();
+
+            for (int i = 0; i < ad.Children.Count; i++)
+            {
+                var decorElem = ad.Children[i];
+                DecorationInfo oneDecorResult = ParseOneDecoration(decorElem);
+                if (oneDecorResult != null)
+                {
+                    decorResult.Add(oneDecorResult);
+                }
+            }
+            //output the decoration result
+            if (decorResult.Count == 0)
+            {
+                InitOutput(output);
+                yield return output;
+            }
+            else
+            { //output each decoration type
+                foreach (var decoration in decorResult)
+                {
+                    InitOutput(output);
+                    FillOneDecoration(output, decoration);
+                    yield return output;
+                }
+            }
+        }
+    }
+
+    private void FillImpressionColumns(DataSourceElement adElem, string PagePositionPrefix, int adNum, Row output)
+    {
+        // Fill up impression columns
+        output["PagePosition"].Set(PagePositionPrefix + (adNum + 1).ToString());
+
+        output["AdId"].Set(Convert.ToUInt64(adElem.GetDataPropertyOrDefault("AdId", "0")));
+        output["ListingId"].Set(Convert.ToUInt64(adElem.GetDataPropertyOrDefault("ListingId", "0")));
+        output["OfferId"].Set(adElem.GetDataPropertyOrDefault("OfferId", "0"));
+        output["OfferId64"].Set(Convert.ToUInt64(adElem.GetDataPropertyOrDefault("OfferId64", "0")));
+        output["Seller"].Set(adElem.GetDataPropertyOrDefault("DisplayUrl", ""));
+        output["ProductImageUrl"].Set(adElem.GetDataPropertyOrDefault("ProductImageUrl", ""));
+        output["Title"].Set(adElem.GetDataPropertyOrDefault("Title", ""));
+        output["OriginalPosition"].Set(adElem.GetDataPropertyOrDefault("OriginalPosition", ""));
+
+        float? imprDwellTime = null;
+        if (adElem.Clicks.Count > 0)
+        {
+            imprDwellTime = adElem.Clicks[0].DwellTimeClickInSecondsV2;
+        }
+        output["ImprDwellTime"].Set(imprDwellTime);
+
+        output["AdClicks"].Set(adElem.Clicks.Count);
+    }
+
+    private DecorationInfo ParseOneDecoration(DataSourceElement decorElem)
+    {
+        DecorationInfo result = new DecorationInfo();
+        string decType = decorElem.GetDataPropertyOrDefault("DecType", "");
+        if (!string.IsNullOrEmpty(decType))
+        {
+            result.decType = decType;
+            result.items = new List<DecorItemInfo>();
+            result.quickBackClicks = 0;
+
+            //Optional
+            result.dataSrceId = (DecorationInfo.DecorDataSrceId)(int.Parse(decorElem.GetDataPropertyOrDefault("DataSrceId", "0")));
+           // result.layout = decorElem.GetDataPropertyOrDefault("Layout", "");
+
+            var decorClickableItems = decorElem.FindElementsWithProperty("T", "D.Url");
+
+            if (decorClickableItems == null || decorClickableItems.Count == 0)
+            {
+                //CO, DCO, FourthLine, SmartCategory, SmartLPT, SS, Twitter, Badge
+                DecorItemInfo decorItem = new DecorItemInfo();
+                decorItem.text = Utils.Unbold(GetDataPropertyOrDefault(decorElem, new[] { "Text", "NarrowViewText", "StandardViewText" }, ""));
+                decorItem.decorItemClicks = 0;
+                result.items.Add(decorItem);
+            }
+
+            else
+            {
+                //MR, CR, FilterLink, SL,
+                for (int itemIdx = 0; itemIdx < decorClickableItems.Count; itemIdx++)
+                {
+                    var clickableItem = decorClickableItems[itemIdx];
+                    DecorItemInfo decorItem = new DecorItemInfo();
+                    decorItem.isClickable = true;
+                    string isBillable = clickableItem.GetDataPropertyOrDefault("Billable", "");
+                    decorItem.isBillable = (isBillable == "true") ? true : false;
+                    decorItem.decorItemClicks = clickableItem.Clicks.Count;
+                    for (int clickIdx = 0; clickIdx < decorItem.decorItemClicks; clickIdx++)
+                    {
+                        if (clickableItem.Clicks[clickIdx].DwellTimeClickInSecondsV2.HasValue
+                            && clickableItem.Clicks[clickIdx].DwellTimeClickInSecondsV2.Value < 20)
+                        {
+                            result.quickBackClicks++;
+                        }
+                    }
+                    decorItem.url = clickableItem.GetDataPropertyOrDefault("Url", "");
+                    result.items.Add(decorItem);
+                }
+            }
+
+            return result;
+
+        }
+
+        return null;
+
+    }
+
+    private string GetDataPropertyOrDefault(DataSourceElement decorElem, string[] properyNames, string defaultValue)
+    {
+        var content = defaultValue;
+        foreach (var propertyName in properyNames)
+        {
+            content = decorElem.GetDataPropertyOrDefault(propertyName, defaultValue);
+            if (!string.IsNullOrEmpty(content) && content != defaultValue)
+            {
+                break;
+            }
+        }
+        return content;
+    }
+
+    private void FillOneDecoration(Row output, DecorationInfo decoration)
+    {
+        output["DecorType"].Set(decoration.decType);
+
+        if (decoration.dataSrceId != DecorationInfo.DecorDataSrceId.None)
+        {
+            output["DecorDataSourceId"].Set(decoration.dataSrceId);
+            output["DecorTypeId"].Set(GetDecorTypeIdFromDataSrceId(decoration.dataSrceId));
+        }
+        else
+        {
+            output["DecorDataSourceId"].Set(0);
+            output["DecorTypeId"].Set(0);
+        }
+
+        int clicks = 0;
+        foreach (var decorItem in decoration.items)
+        {
+            clicks += decorItem.decorItemClicks;
+        }
+        output["DecorClicks"].Set(clicks);
+        output["DecorQBClicks"].Set(decoration.quickBackClicks);
+    }
+
+    private int GetDecorTypeIdFromDataSrceId(DecorationInfo.DecorDataSrceId dataSrceId)
+    {
+        switch (dataSrceId)
+        {
+            case DecorationInfo.DecorDataSrceId.AttributeAnnotationDatasource:
+                return (int)DecorationInfo.DecorDataSrceId.AttributeAnnotation;
+            case DecorationInfo.DecorDataSrceId.TopVisitedAnnotationDatasource:
+                return (int)DecorationInfo.DecorDataSrceId.TopVisitedAnnotation;
+            default:
+                return (int)dataSrceId;
+        }
+    }
+
+}
+#ENDCS

@@ -1,0 +1,288 @@
+﻿//Script GUID:9ca02cdf-d3b1-4d3a-816b-caf727133940
+//Used for tracking history
+#DECLARE StartDateTimeUtc DateTime = DateTime.Parse(@@JOB_Date@@);
+#DECLARE EndDateTimeUtc DateTime = @StartDateTimeUtc.AddHours(1);
+
+#DECLARE ScopeUtilDll string = @"/shares/bingads.algo.adsplus/AdsPlusDataShare/Team/Resources/AdPredictor.ScopeUtils.dll";
+USING Microsoft.AdPredictor.ScopeUtils REFERENCE @ScopeUtilDll;
+
+#DECLARE FltNumberLine string = @"AdsFLN4";
+#DECLARE FlightId string = @"31172";
+#DECLARE Market string = "en-US";
+#DECLARE LogDate string = @StartDateTimeUtc.ToString("yyyy-MM-dd");
+#DECLARE Outpath string = String.Format("/local/AdsOI/SERP/MV/{0}/{1:D2}", @StartDateTimeUtc.Year, @StartDateTimeUtc.Month);
+#DECLARE OuputStat string = String.Format("{0}/MVDump_PAExtensions_Stat_{1}.ss", @Outpath, @LogDate);
+#DECLARE OuputCore string = String.Format("{0}/MVDump_PAExtensions_Core_{1}.ss", @Outpath, @LogDate);
+#DECLARE OuputNonCore string = String.Format("{0}/MVDump_PAExtensions_NonCore_{1}.ss", @Outpath, @LogDate);
+#DECLARE OuputYahoo string = String.Format("{0}/MVDump_PAExtensions_Yahoo_{1}.ss", @Outpath, @LogDate);
+
+MVUnpiv = VIEW "/shares/adCenter.BICore.SubjectArea/SubjectArea/Monetization/views/PROD/MonetizationFacts.view"
+    PARAMS 
+    (
+        StartDateTimeUtc = @StartDateTimeUtc,
+        EndDateTimeUtc = @EndDateTimeUtc,
+
+        LoadDlls = true,
+
+        UnpivotAdExtensionItem = true,
+
+        ReadClicks = true,
+        ReadAdImpressions = true,
+        ReadPageViews = true
+    );
+
+MVData =
+    SELECT *
+    FROM MVUnpiv
+    WHERE NOT Tools.IsFraudItem(PagePosition, IsFraud, FraudQualityType, FraudReason);
+
+DataGr =
+    SELECT RGUID,
+           PageViewCnt,
+           ImpressionCnt,
+           ClickCnt,
+           PagePositionId,
+
+           PagePosition,
+           (bool?) IsFraud AS IsFraud,
+
+           AdId,
+           OrderId,
+           OrderItemId AS ListingId,
+           DomainSpecificId,
+           UniqueAdListingId,
+           (uint?) CampaignTypeId AS CampaignTypeId,
+           ListingAdInfo,
+
+           AmountChargedUSDMonthlyExchangeRt AS Revenue,
+
+           MBDate AS UtcTime,
+
+           QueryPhrase,
+           NonNormalizedQueryString AS RawQuery,
+           BiddedKeyword,
+           MatchTypeId,
+
+           RelatedToAccountId,
+           MarketplaceClassificationId,
+           MediumId,
+           DeviceTypeId,
+           DistributionChannelId,
+           FormCode,
+           FormCodeClassification,
+           WebsiteCountry,
+           AdLanguage,
+           TrafficPartitionCode,
+           LanguageCode,
+           QueryCategorizations,
+           AdScenarioType,
+           SubMatchTypeId,
+           AdScenarioFeedId,
+           AdScenarioFeedItemId,
+           AdScenarioFeedSourceId,
+
+           CustomerId,
+           AdvertiserAccountId,
+           CampaignId,
+           AdGroupId,
+           IncomingPublisherWebSiteCountry,
+           TargetTypeId,
+           DataCenterId,
+
+           DomainType,
+           AdDisplayTypeId,
+
+           RelevanceScore,
+           RankScore,
+           ProbabilityOfClick AS AHpClick,
+
+           Tools.ParseFlightNumber(FIRST(FlightInfoRecordList), "AdsFLN0") AS Flight_adsfln0,
+           Tools.ParseFlightNumber(FIRST(FlightInfoRecordList), "AdsFLN1") AS Flight_adsfln1,
+           Tools.ParseFlightNumber(FIRST(FlightInfoRecordList), "AdsFLN4") AS Flight_adsfln4,
+           Tools.ParseFlightNumber(FIRST(FlightInfoRecordList), "AdsFLN7") AS Flight_adsfln7,
+           Tools.ParseFlightNumber(FIRST(FlightInfoRecordList), "AdsFLN9") AS Flight_adsfln9,
+           FIRST(FlightInfoRecordList) AS FlightInfoRecordList,
+
+           string.Join(",", LIST((ImpressionCnt > 0 ? AdExtensionTypeId.ToString() : "") +
+                                    (ImpressionCnt > 0 && AdExtensionRenderedLayoutId != 0 ? "-" + AdExtensionRenderedLayoutId.ToString() : "") ).
+                            Where(id => !string.IsNullOrEmpty(id) && id != "0")) AS DecorTypeIds_old, // Format: ExtentionId-RenderedLayoutId
+
+           ScopeArray.Create(ARRAY_AGG(ImpressionCnt > 0 ? AdExtensionTypeId : (short?)null).Where(e => e.HasValue).Select(e => e.Value)) AS DecorTypeIds,
+           ScopeArray.Create(ARRAY_AGG(ImpressionCnt > 0 ? AdExtensionRenderedLayoutId : (ushort?)null).Where(e => e.HasValue).Select(e => e.Value)) AS DecorRenderedLayouts,
+           ScopeArray.Create(ARRAY_AGG(ImpressionCnt > 0 ? AdExtensionGroupId : (short?)null).Where(e => e.HasValue).Select(e => e.Value)) AS DecorGroupIds,
+           
+           ScopeArray.Create(ARRAY_AGG(ImpressionCnt > 0 ? AdExtensionNotDisplayedReason : (byte?)null).Where(e => e.HasValue).Select(e => e.Value)) AS DecorNotDisplayedReasons,
+           ScopeArray.Create(ARRAY_AGG(ImpressionCnt > 0 ? AdExtensionItemNotDisplayedReason : (byte?)null).Where(e => e.HasValue).Select(e => e.Value)) AS DecorItemNotDisplayedReasons,
+
+           ScopeArray.Create(ARRAY_AGG(ImpressionCnt > 0 ? AdExtensionTokenId : (ushort?)null).Where(e => e.HasValue).Select(e => e.Value)) AS DecorTokenIds,
+           ScopeArray.Create(ARRAY_AGG(ImpressionCnt > 0 ? AdExtensionItemTokenId : (ushort?)null).Where(e => e.HasValue).Select(e => e.Value)) AS DecorItemTokenIds,
+
+           ScopeArray.Create(ARRAY_AGG(ClickCnt > 0 ? AdExtensionTypeId : (short?)null).Where(e => e.HasValue).Select(e => e.Value)) AS DecorClicksTypeIds
+    FROM MVData;
+
+FlightData =
+    SELECT DISTINCT
+            RGUID,
+            AdId,
+            OrderId,
+            ListingId,
+            CustomerId,
+            AdvertiserAccountId,
+            CampaignId,
+            AdGroupId,
+            RelatedToAccountId,
+            MarketplaceClassificationId,
+            MediumId,
+            DistributionChannelId,
+            Tools.IsRelatedToYahoo(RelatedToAccountId, MarketplaceClassificationId, MediumId, DistributionChannelId) AS IsYahooRelated,
+
+            PageViewCnt,
+            ImpressionCnt,
+            ClickCnt,
+            Revenue,
+            PagePosition.StartsWith("PO") ? ImpressionCnt : 0 AS POImpressionCnt,
+            PagePosition.StartsWith("ML") ? ImpressionCnt : 0 AS MLImpressionCnt,
+            PagePosition.StartsWith("MD") ? ImpressionCnt : 0 AS MDImpressionCnt,
+            PagePosition.StartsWith("SB") ? ImpressionCnt : 0 AS SBImpressionCnt,
+
+            PagePosition,
+            ((PagePosition.Length >2)? PagePosition.Substring(0,2):PagePosition) AS AdPosition,
+            UtcTime,
+            UtcTime.HasValue? TimeZoneInfo.ConvertTimeFromUtc(UtcTime.Value,
+                        TimeZoneInfo.FindSystemTimeZoneById("Pacific Standard Time")) : (DateTime?) null AS PstTime,
+
+            QueryPhrase,
+            RawQuery,
+            BiddedKeyword,
+            DataCenterId,
+            RankScore,
+            RelevanceScore,
+            AHpClick,
+
+            DeviceTypeId,
+            WebsiteCountry,
+            AdLanguage,
+            Flight_adsfln4 AS FlightNum,
+
+            DecorTypeIds_old,
+
+            // Decorations
+            DecorTypeIds.Contains(52) ? 1 : 0 AS Decor_MerchantPromotion_Impr, // SpecialOffer
+            DecorTypeIds.Contains(56) ? 1 : 0 AS Decor_LocalInventoryExtension_Impr,
+
+            DecorTypeIds.Contains(16134) ? 1 : 0 AS Decor_PABadge_Impr,
+            DecorTypeIds.Contains(16135) ? 1 : 0 AS Decor_ConditionAnnotation_Impr, // Refurbished
+            DecorTypeIds.Contains(16250) ? 1 : 0 AS Decor_EliteBadge_Impr, // MerchantRating
+            DecorTypeIds.Contains(16251) ? 1 : 0 AS Decor_PriceDropAlert_Impr,
+            DecorTypeIds.Contains(16252) ? 1 : 0 AS Decor_ProductRating_Impr,
+            DecorTypeIds.Contains(16253) ? 1 : 0 AS Decor_FreeShipping_Impr,
+            DecorTypeIds.Contains(16254) ? 1 : 0 AS Decor_ThreeDimensionalProductAds_Impr, // ImageOverlay
+            DecorTypeIds.Contains(16257) ? 1 : 0 AS Decor_BrandLoyalty_Impr,
+            DecorTypeIds.Contains(16260) ? 1 : 0 AS Decor_AttributeAnnotation_Impr, // TopSold
+            DecorTypeIds.Contains(16262) ? 1 : 0 AS Decor_TopVisitedAnnotation_Impr, // TopViewed
+            DecorTypeIds.Contains(16264) ? 1 : 0 AS Decor_PAVisitedLinksAnnotation_Impr,
+            DecorTypeIds.Contains(16268) ? 1 : 0 AS Decor_PriceDropAlertBadge_Impr,
+            DecorTypeIds.Contains(16270) ? 1 : 0 AS Decor_FreeReturns_Impr,
+            DecorTypeIds.Contains(16271) ? 1 : 0 AS Decor_SaleBadge_Impr,
+            DecorTypeIds.Contains(16272) ? 1 : 0 AS Decor_SaleExtension_Impr,
+            DecorTypeIds.Contains(16273) ? 1 : 0 AS Decor_PAShortTitle_Impr,
+            DecorTypeIds.Contains(16275) ? 1 : 0 AS Decor_PAImageAnnotation_Impr,
+            DecorTypeIds.Contains(16278) ? 1 : 0 AS Decor_PABusinessAttributes_Impr
+    FROM DataGr;
+
+FlightData = SELECT * FROM FlightData WHERE AdPosition IN ("PO", "ML", "MD","SB");
+
+MvStat =
+    SELECT
+        @LogDate AS LogDate,
+        IsYahooRelated,
+        PagePosition,
+        AdPosition,
+        DeviceTypeId,
+        WebsiteCountry,
+        AdLanguage,
+        FlightNum,
+        SUM(PageViewCnt) AS TotalPageViews,
+        SUM(ImpressionCnt) AS TotalImpressions,
+        SUM(POImpressionCnt) AS PoleImpressions,
+        SUM(MLImpressionCnt) AS MainlineImpressions,
+        SUM(MDImpressionCnt) AS MiddleImpressions,
+        SUM(SBImpressionCnt) AS SidebarImpressions,
+        SUM(ClickCnt) AS TotalClicks,
+        SUM(Revenue) AS TotalRevenue,
+        SUM(Decor_MerchantPromotion_Impr) AS MerchantPromotion,
+        SUM(Decor_LocalInventoryExtension_Impr) AS LocalInventory,
+        SUM(Decor_PABadge_Impr) AS PriceDropBadge,
+        SUM(Decor_ConditionAnnotation_Impr) AS ConditionAnnotation,
+        SUM(Decor_EliteBadge_Impr) AS EliteBadge,
+        SUM(Decor_PriceDropAlert_Impr) AS PriceDrop,
+        SUM(Decor_ProductRating_Impr) AS ProductRating,
+        SUM(Decor_FreeShipping_Impr) AS FreeShipping,
+        SUM(Decor_ThreeDimensionalProductAds_Impr) AS ImageOverlay,
+        SUM(Decor_BrandLoyalty_Impr) AS BrandLoyalty,
+        SUM(Decor_AttributeAnnotation_Impr) AS TopSold,
+        SUM(Decor_TopVisitedAnnotation_Impr) AS TopViewed,
+        SUM(Decor_PAVisitedLinksAnnotation_Impr) AS VisitedLink,
+        SUM(Decor_FreeReturns_Impr) AS FreeReturns,
+        SUM(Decor_SaleBadge_Impr) AS SaleBadge,
+        SUM(Decor_SaleExtension_Impr) AS SaleExtension,
+        SUM(Decor_PAShortTitle_Impr) AS ShortTitle,
+        SUM(Decor_PAImageAnnotation_Impr) AS ImageAnnotation,
+        SUM(Decor_PABusinessAttributes_Impr) AS BusinessAttribute
+    FROM FlightData
+    GROUP BY
+        LogDate,
+        IsYahooRelated,
+        PagePosition,
+        AdPosition,
+        DeviceTypeId,
+        WebsiteCountry,
+        AdLanguage,
+        FlightNum
+;
+
+OUTPUT MvStat
+TO SSTREAM @OuputStat
+WITH STREAMEXPIRY "180";
+
+ResultNewCore =
+    SELECT *
+    FROM FlightData
+    WHERE RelatedToAccountId == 1004
+          AND WebsiteCountry == "us"
+          AND AdLanguage == "en"
+          AND MarketplaceClassificationId == 1
+          AND (MediumId == 1 OR MediumId == 3)
+          AND DistributionChannelId == 1;
+
+OUTPUT ResultNewCore TO SSTREAM @OuputCore
+    CLUSTERED BY RGUID, QueryPhrase
+    SORTED BY RGUID, QueryPhrase
+    WITH STREAMEXPIRY "30";
+
+// ResultNewNotCore =
+//     SELECT *
+//     FROM FlightData
+//     WHERE RelatedToAccountId == 1004
+//           AND NOT (
+//             WebsiteCountry == "us" AND AdLanguage == "en"
+//             AND MarketplaceClassificationId == 1
+//             AND (MediumId == 1 OR MediumId == 3)
+//             AND DistributionChannelId == 1
+//           );
+// 
+// OUTPUT ResultNewNotCore TO SSTREAM @OuputNonCore
+//     CLUSTERED BY RGUID, QueryPhrase
+//     SORTED BY RGUID, QueryPhrase
+//     WITH STREAMEXPIRY "30";
+// 
+// 
+// ResultYahoo =
+//     SELECT *
+//     FROM FlightData
+//     WHERE RelatedToAccountId != 1004;
+// 
+// OUTPUT ResultYahoo TO SSTREAM @OuputYahoo
+//     CLUSTERED BY RGUID, QueryPhrase
+//     SORTED BY RGUID, QueryPhrase
+//     WITH STREAMEXPIRY "30";

@@ -1,0 +1,277 @@
+﻿//Script GUID:2fbbecdd-91ec-4bee-bfae-2e2dfc2c32e1
+//Used for tracking history
+#DECLARE PstTimeSuffix string = @" 0:00:00 AM -08:00";
+#DECLARE DateFormat string = @"yyyy-MM-dd";
+#DECLARE StartTimePst DateTime = DateTime.Parse(@@JOB_Date@@ + @PstTimeSuffix); // JOB_Date should be like yyyy-MM-dd or M/dd/yyyy
+#DECLARE EndTimePst DateTime = @StartTimePst.AddDays(1);
+#DECLARE StartDateStringPst string = @StartTimePst.ToString(@DateFormat);       // Slapi view accepts date string in PST
+#DECLARE EndDateStringPst string = @EndTimePst.ToString(@DateFormat);
+#DECLARE StartTimeUtc DateTime = @StartTimePst.ToUniversalTime();               // MZ view accepts DateTime in UTC
+#DECLARE EndTimeUtc DateTime = @EndTimePst.ToUniversalTime();
+
+#DECLARE FltNumberLine string = @"AdsFLN4";
+#DECLARE FlightId int = 31172;
+#DECLARE Market string = "en-US";
+
+#DECLARE Outpath string = String.Format("/local/AdsOI/SERP/SLAPI/{0}/{1:D2}", @StartTimeUtc.Year, @StartTimeUtc.Month);
+#DECLARE LogDate string = @StartTimeUtc.ToString("yyyy-MM-dd");
+
+SearchLogPageView = 
+    VIEW "/shares/searchDM/distrib/released/SLAPI/SearchLogPageView.view" 
+    PARAMS 
+    (    Start = @StartDateStringPst,
+         End = @EndDateStringPst,
+         Dataset = "Bing.com",
+         ReturnAbnormalTraffic = true,
+         UseSample = false
+    );
+
+MergedLogs =
+    SELECT RGUID,
+           Request_ImpressionGuid AS ImpressionGuid,
+           Request_RequestTime AS RequestTime,
+           Market,
+           Vertical,
+           Request_OSInfo.ProductName AS OS,
+           Request_Browser AS Browser,
+           Metrics_DwellTime,
+           DataSources,
+           Utils.SLAPIGetAdsFlightId(DataSources.FindElementsWithProperty("T", "D.Top.AdsDomain.AdCenter")[0].GetDataPropertyOrDefault("AdsFlights", "").ToLower(), @FltNumberLine) AS FlightId
+    FROM SearchLogPageView
+    WHERE Query_IsNormal
+          AND Market == @Market
+          AND Vertical == "web"
+          AND Page_Name == "Page.Serp"
+    HAVING FlightId == @FlightId;
+
+SLAPIData =
+    PROCESS MergedLogs
+    USING SlapiPADecorParser();
+
+#DECLARE SLAPIDataOutput string = String.Format("{0}/SLAPIRaw_{1}.ss", @Outpath, @LogDate);
+OUTPUT SLAPIData TO SSTREAM @SLAPIDataOutput CLUSTERED BY RequestTime SORTED BY RequestTime WITH STREAMEXPIRY "90";
+
+// ------------------------------------------------------------------------------------------------------
+
+#CS
+using Microsoft.SCOPE.Types;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using ScopeRuntime;
+
+public static class Utils
+{
+    private const char start = '\uE000';
+    private const char end = '\uE001';
+
+    public static int SafeParserInt(string intStr)
+    {
+        if (string.IsNullOrEmpty(intStr))
+        {
+            return 0;
+        }
+        else
+        {
+            return int.Parse(intStr);
+        }
+    }
+
+    public static int SLAPIGetAdsFlightId(string intStr, string FlightLine)
+    {
+        if (string.IsNullOrEmpty(intStr))
+        {
+            return 0;
+        }
+ 
+        var result = intStr.Split('|');
+        foreach (var flightId in result)
+        {
+            var item = flightId.Split(':');
+            if (item.Length == 2 && item[0] == FlightLine.ToLower())
+            {
+                return SafeParserInt(item[1]);
+            }
+        }
+        return 0;
+    }
+ 
+    public static string Unbold(string str)
+    {
+        if (string.IsNullOrEmpty(str))
+        {
+            return string.Empty;
+        }
+        var sb = new StringBuilder();
+        foreach (var c in str)
+        {
+            if (c == start || c == end) continue;
+            sb.Append(c);
+        }
+        return sb.ToString();
+    }
+}
+
+public class SlapiPADecorParser : Processor
+{
+    public override Schema Produces(string[] requestedColumns, string[] args, Schema input)
+    {
+        var result = new Schema(new[] {
+            // Common columns
+            "RGUID",
+            "ImpressionGuid",
+            "RequestTime",
+            "OS",
+            "Browser",
+            "PageDwellTime:double?",
+
+            // Impression columns
+            "PagePosition",
+            "OriginalPosition",
+            "AdId:ulong",
+            "ListingId:ulong",
+            "OfferId64:ulong",
+            "Seller",
+
+            //Decoration info. Columns
+            "Decor_ProductRating:int",
+            "Decor_FreeShipping:int",
+            "Decor_SpecialOffer:int",
+            "Decor_TopSold:int",
+            "Decor_TopVisited:int",
+            "Decor_EliteBadge:int",
+            "Decor_Condition:int",
+            "Decor_LocalInventory:int",
+            "Decor_PriceDrop:int"
+        });
+
+        return result;
+    }
+
+    public override IEnumerable<Row> Process(RowSet input, Row output, string[] args)
+    {
+        foreach (Row row in input.Rows)
+        {
+            DataSourceList dataSources = row["DataSources"].Value as DataSourceList;
+            string rguid = dataSources.FindElementsWithProperty("T", "D.Top.AdsDomain.AdCenter")[0].GetDataPropertyOrDefault("RequestId", "");
+
+            // Set common columns
+            output["RGUID"].Set(rguid.ToLower());
+            output["ImpressionGuid"].Set(row["ImpressionGuid"].String.ToLower());
+            output["RequestTime"].Set(row["RequestTime"].String);
+            output["OS"].Set(row["OS"].String);
+            output["Browser"].Set(row["Browser"].String);
+            output["PageDwellTime"].Set(row["Metrics_DwellTime"].DoubleQ);
+
+            var adElemML = dataSources.FindElementsWithProperty("Position", "Crest").FindElementsWithProperty("AdType", "ProductListingAd");
+            var adElemSB = dataSources.FindElementsWithProperty("Position", "Flank").FindElementsWithProperty("AdType", "ProductListingAd");
+            var adElemPole = dataSources.FindElementsWithProperty("Position", "Pole").FindElementsWithProperty("AdType", "ProductListingAd");
+            var adElemMoP = dataSources.FindElementsWithProperty("Position", "Middle").FindElementsWithProperty("AdType", "ProductListingAd");
+
+            if (adElemML.Count > 0)
+            {
+                foreach (var item in ProcessAdPosition(adElemML, "ML", output))
+                {
+                    yield return item;
+                }
+            }
+            if (adElemSB.Count > 0)
+            {
+                foreach (var item in ProcessAdPosition(adElemSB, "SB", output))
+                {
+                    yield return item;
+                }
+            }
+            if (adElemPole.Count > 0)
+            {
+                foreach (var item in ProcessAdPosition(adElemPole, "PO", output))
+                {
+                    yield return item;
+                }
+            }
+            if (adElemMoP.Count > 0)
+            {
+                foreach (var item in ProcessAdPosition(adElemMoP, "MD", output))
+                {
+                    yield return item;
+                }
+            }
+        }
+    }
+
+    private IEnumerable<Row> ProcessAdPosition(DataSourceList adList, string Position, Row output)
+    {
+        for (int adNum = 0; adNum < adList.Count; adNum++)
+        {
+            var ad = adList[adNum];
+            InitOutput(output);
+            FillImpressionColumns(ad, Position, adNum, output);
+            FillDecorationColumns(ad, output);
+            yield return output;
+        }
+    }
+
+    public void InitOutput(Row output)
+    {
+        int firstIdx = output.Schema.IndexOf("Decor_ProductRating");
+        for (int ColIdx = firstIdx; ColIdx < output.Schema.Count; ColIdx++)
+        {
+            output[ColIdx].Set(0);
+        }
+    }
+
+    private void FillImpressionColumns(DataSourceElement adElem, string PagePositionPrefix, int adNum, Row output)
+    {
+        // Fill up impression columns
+        output["PagePosition"].Set(PagePositionPrefix + (adNum + 1).ToString());
+        output["AdId"].Set(Convert.ToUInt64(adElem.GetDataPropertyOrDefault("AdId", "0")));
+        output["ListingId"].Set(Convert.ToUInt64(adElem.GetDataPropertyOrDefault("ListingId", "0")));
+        output["OfferId64"].Set(Convert.ToUInt64(adElem.GetDataPropertyOrDefault("OfferId64", "0")));
+        output["Seller"].Set(adElem.GetDataPropertyOrDefault("DisplayUrl", ""));
+        output["OriginalPosition"].Set(adElem.GetDataPropertyOrDefault("OriginalPosition", ""));
+    }
+
+    private void FillDecorationColumns(DataSourceElement adElem, Row output)
+    {
+        // Fill up decoration columns
+        TryFindDecorationType(adElem, "D.Ad.ProductRating", "Decor_ProductRating", output);
+        TryFindDecorationType(adElem, "D.Ad.MerchantPromotion", "Decor_SpecialOffer", output);
+        TryFindDecorationType(adElem, "D.Ad.PAMR", "Decor_EliteBadge", output);
+        TryFindDecorationType(adElem, "D.Ad.LocalInventory", "Decor_LocalInventory", output);
+        TryFindDecorationType(adElem, "D.Ad.Targeted", "", output);
+    }
+
+    private void TryFindDecorationType(DataSourceElement adElem, string logType, string outputColumnName, Row output)
+    {
+        var decType = adElem.FindElementsWithProperty("T", logType)[0].GetDataPropertyOrDefault("DecType", "");
+        if (logType == "D.Ad.Targeted")
+        {
+            switch (decType)
+            {
+                case "FreeShipping":
+                    output["Decor_FreeShipping"].Set(1);
+                    break;
+                case "AttributeAnnotation":
+                    output["Decor_TopSold"].Set(1);
+                    break;
+                case "PABadge":
+                    output["Decor_Condition"].Set(1);
+                    break;
+                case "PriceDropAlert":
+                    output["Decor_PriceDrop"].Set(1);
+                    break;
+                case "TopVisitedAnnotation":
+                    output["Decor_TopVisited"].Set(1);
+                    break;
+                default:
+                    break;
+            }
+        }
+        else
+        {
+            output[outputColumnName].Set(String.IsNullOrEmpty(decType) ? 1 : 0);
+        }
+    }
+}
+#ENDCS

@@ -1,0 +1,500 @@
+﻿//Script GUID:c943b9a4-3d6e-48bb-a979-907abf8ac239
+//Used for tracking history
+#DECLARE StartDateTimeUtc DateTime = DateTime.Parse(@@JOB_Date@@);
+#DECLARE EndDateTimeUtc DateTime = @StartDateTimeUtc.AddDays(1);
+
+#DECLARE FltNumberLine string = @"AdsFLN4";
+#DECLARE Outpath string = String.Format("/local/AdsOI/SERP/SLAPI/{0}/{1:D2}", @StartDateTimeUtc.Year, @StartDateTimeUtc.Month);
+#DECLARE FilenameExt string = @FltNumberLine; // + "-" + @FlightId + "-" + @Market;
+#DECLARE LogDate string = @StartDateTimeUtc.ToString("yyyy-MM-dd");
+#DECLARE OutputRaw string = String.Format("{0}/SlapiRaw_PA_{1}_{2}.ss", @Outpath, @FilenameExt, @LogDate);
+#DECLARE OutputStat string = String.Format("{0}/SlapiStat_PA_{1}_{2}.ss", @Outpath, @FilenameExt, @LogDate);
+
+SearchLogPageView = 
+    VIEW "/shares/searchDM/distrib/released/SLAPI/SearchLogPageView.view"
+    PARAMS 
+    (    Start = @StartDateTimeUtc.ToString("yyyy-MM-dd"),
+         End = @EndDateTimeUtc.ToString("yyyy-MM-dd"),
+         Dataset = "Bing.com",
+         ReturnAbnormalTraffic = false,
+         UseSample = false
+    );
+
+MergedLogs =
+    SELECT RGUID,
+           ClientId,
+           Request_ImpressionGuid,
+           Request_FrontDoorImpressionEventId.ToLower() AS FrontDoorIG,
+           Query_RawQuery.Trim().ToLower() AS RawQuery,
+           Request_Cookies["MUID"].Value AS MUID,
+           Market,
+           Vertical,
+           Request_OSInfo.ProductName AS OS,
+           Metrics_DwellTime,
+           DataSources,
+           SlapiUtils.GetAdsFlightId(DataSources.FindElementsWithProperty("T", "D.Top.AdsDomain.AdCenter")[0].GetDataPropertyOrDefault("AdsFlights", "").ToLower(), @FltNumberLine) AS FlightId
+    FROM SearchLogPageView
+    WHERE Query_IsNormal
+          AND Vertical == "web"
+          AND Page_Name == "Page.Serp"
+          AND NOT User_HasMsIp
+          AND NOT Query_IsAdult
+          AND NOT Request_IsAbnormalTraffic
+          AND NOT string.IsNullOrEmpty(Request_ImpressionGuid)
+          AND NOT string.IsNullOrEmpty(Query_RawQuery)
+;
+
+SLAPIData =
+    PROCESS MergedLogs
+    USING SlapiPADecorParser();
+
+PASLAPIDistinctData =
+    SELECT DISTINCT Request_ImpressionGuid,
+                    MUID,
+                    Market,
+                    FlightId,
+                    OS,
+                    PageDwellTime,
+                    PagePosition,
+                    OriginalPosition AS AdPosition,
+                    AdId,
+                    ListingId,
+                    OfferId64,
+                    Seller,
+                    RawQuery,
+                    AdClicks,
+                    ImprDwellTime,
+                    DecorType,
+                    DecorDataSourceId,
+                    DecorClicks,
+                    DecorQBClicks
+    FROM SLAPIData;
+
+OUTPUT PASLAPIDistinctData
+TO SSTREAM @OutputRaw
+CLUSTERED BY Request_ImpressionGuid
+SORTED BY Request_ImpressionGuid
+WITH STREAMEXPIRY "90";
+
+SlapiStat =
+    SELECT
+        @LogDate AS LogDate,
+        Market,
+        FlightId,
+        OS,
+        PagePosition,
+        AdPosition,
+        DecorType,
+        SUM(PageDwellTime) AS TotalPageDwellTime,
+        SUM(AdClicks) AS TotalClicks,
+        SUM(ImprDwellTime) AS TotalImprDwellTime,
+        SUM(DecorClicks) AS DecorClicks,
+        SUM(DecorQBClicks) AS DecorQBClicks
+    FROM PASLAPIDistinctData
+    GROUP BY
+        LogDate,
+        Market,
+        FlightId,
+        OS,
+        PagePosition,
+        AdPosition,
+        DecorType
+    ;
+
+OUTPUT SlapiStat
+TO SSTREAM @OutputStat
+WITH STREAMEXPIRY "180";
+
+#CS
+using Microsoft.SCOPE.Types;
+using MS.Internal.Bing.DataMining.SearchLogApi;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using ScopeRuntime;
+
+public static class SlapiUtils
+{
+    private const char start = '\uE000';
+    private const char end = '\uE001';
+    private const string Delimiter = "\t";
+
+    public static string GetSignature(params string[] args)
+    {
+        return string.Join(Delimiter, args).GetHashCode().ToString();
+    }
+
+    public static int SafeParserInt(string intStr)
+    {
+        if (string.IsNullOrEmpty(intStr))
+        {
+            return 0;
+        }
+        else
+        {
+            return int.Parse(intStr);
+        }
+    }
+
+    public static int GetAdsFlightId(string intStr, string FlightLine)
+    {
+        if (string.IsNullOrEmpty(intStr))
+        {
+            return 0;
+        }
+
+        var result = intStr.Split('|');
+        foreach (var flightId in result)
+        {
+            var item = flightId.Split(':');
+            if (item.Length == 2 && item[0] == FlightLine.ToLower())
+            {
+                return SafeParserInt(item[1]);
+            }
+        }
+        return 0;
+    }
+
+    public static string Unbold(string str)
+    {
+        if (string.IsNullOrEmpty(str))
+        {
+            return string.Empty;
+        }
+        var sb = new StringBuilder();
+        foreach (var c in str)
+        {
+            if (c == start || c == end) continue;
+            sb.Append(c);
+        }
+        return sb.ToString();
+    }
+}
+
+
+public class DecorItemInfo
+{
+    public string text;
+    public string url;
+    public bool isClickable;
+    public bool isBillable;
+    public string desc1;
+    public string desc2;
+    public int decorItemClicks;
+
+}
+
+public class DecorationInfo
+{
+    public List<DecorItemInfo> items; //could be only 1 item
+    public string decType;
+    public string layout;
+    public int height;
+    public int width;
+    public int lineCount;
+    public DecorDataSrceId dataSrceId;
+    public string position; //RightFloated (such as: image, video ,button etc.)
+
+    public int quickBackClicks;
+
+    public static int MAX_ITEM_COUNT = 6;
+    public enum DecorDataSrceId
+    {
+        None = 0,
+        ConditionAnnotation = 16135,
+        PriceDropAlert = 16251,
+        ProductRating = 16252,
+        FreeShipping = 16253,
+        SmartCategory = 16027,
+        AttributeAnnotation = 16260,
+        AttributeAnnotationDatasource = 16261,
+        TopVisitedAnnotation = 16262,
+        TopVisitedAnnotationDatasource = 16263,
+        PAVisitedLinksAnnotation = 16264,
+        PAVisitedLinksAnnotationDatasource = 16265,
+        PriceDropAlertBadge = 16268,
+        FreeReturnsDatasource = 16269,
+        FreeReturns = 16270,
+        SaleBadge = 16271,
+        SaleExtension = 16272,
+    }
+
+}
+
+public class SlapiPADecorParser : Processor
+{
+    public static int MAX_ITEM_COUNT = 6;
+    public void InitOutput(Row output)
+    {
+        int firstIdx = output.Schema.IndexOf("DecorType");
+
+        for (int ColIdx = firstIdx; ColIdx < output.Schema.Count; ColIdx++)
+        {
+            if (output.Schema[ColIdx].Type == ColumnDataType.Integer)
+            {
+                output[ColIdx].Set(0);
+            }
+            else
+            {
+                output[ColIdx].Set("");
+            }
+        }
+    }
+
+    public override Schema Produces(string[] requestedColumns, string[] args, Schema input)
+    {
+        var result = new Schema(new[] {
+             // Common columns
+            "RGUID",
+            "ClientId",
+            "RawQuery",
+            "Request_ImpressionGuid",
+            "FrontDoorIG",
+            "MUID",
+            "Market",
+            "FlightId",
+            "Vertical",
+            "OS",
+            "PageDwellTime:double?",
+ 
+             // Impression columns
+                "PagePosition",
+                "OriginalPosition",
+                "AdId:ulong",
+                "ListingId:ulong",
+                "OfferId",
+                "OfferId64:ulong",
+                "Seller",
+                "ProductImageUrl",
+                "Title",
+                "AdClicks:int",
+                "ImprDwellTime:float?",
+ 
+            //Decoration info. Columns
+                "DecorType",
+                "DecorDataSourceId",
+                "DecorClicks:int",
+                "DecorQBClicks:int"
+
+            });
+        return result;
+    }
+
+    public override IEnumerable<Row> Process(RowSet input, Row output, string[] args)
+    {
+        foreach (Row row in input.Rows)
+        {
+            DataSourceList dataSources = row["DataSources"].Value as DataSourceList;
+            string rguid = dataSources.FindElementsWithProperty("T", "D.Top.AdsDomain.AdCenter")[0].GetDataPropertyOrDefault("RequestId", "");
+
+            // Set common columns
+
+            output["RGUID"].Set(rguid.ToLower());
+            output["ClientId"].Set(row["ClientId"].String.ToLower());
+            output["FrontDoorIG"].Set(row["FrontDoorIG"].String.ToLower());
+            output["Request_ImpressionGuid"].Set(row["Request_ImpressionGuid"].String.ToLower());
+            output["RawQuery"].Set(row["RawQuery"].String);
+            output["MUID"].Set(row["MUID"].String);
+            output["Market"].Set(row["Market"].String);
+            output["FlightId"].Set(row["FlightId"].String);
+            output["Vertical"].Set(row["Vertical"].String);
+
+            output["OS"].Set(row["OS"].String);
+            output["PageDwellTime"].Set(row["Metrics_DwellTime"].DoubleQ);
+
+            //ML
+            var adElemML = dataSources.FindElementsWithProperty("Position", "Crest").FindElementsWithProperty("AdType", "ProductListingAd");
+            var adElemSB = dataSources.FindElementsWithProperty("Position", "Flank").FindElementsWithProperty("AdType", "ProductListingAd");
+            var adElemPole = dataSources.FindElementsWithProperty("Position", "Pole").FindElementsWithProperty("AdType", "ProductListingAd");
+            var adElemMoP = dataSources.FindElementsWithProperty("Position", "Middle").FindElementsWithProperty("AdType", "ProductListingAd");
+
+            // "Crest", "Flank", "Pole",  "Middle"
+            //    var PAList = dataSources.FindElementsWithProperty(MS.Internal.Bing.DataMining.SearchLogApi.FilterSettings.Or, MS.Internal.Bing.DataMining.SearchLogApi.Helpers.StringToKvp("Position", "Crest", "Position", "Flank", "Position", "Pole", "Position", "Middle")).FindElementsWithProperty("AdType", "ProductListingAd");
+            if (adElemML.Count > 0)
+            {
+                foreach (var item in ProcessAdPosition(adElemML, "ML", output))
+                {
+                    yield return item;
+                }
+            }
+            if (adElemSB.Count > 0)
+            {
+                foreach (var item in ProcessAdPosition(adElemSB, "SB", output))
+                {
+                    yield return item;
+                }
+            }
+            if (adElemPole.Count > 0)
+            {
+                foreach (var item in ProcessAdPosition(adElemPole, "PO", output))
+                {
+                    yield return item;
+                }
+            }
+            if (adElemMoP.Count > 0)
+            {
+                foreach (var item in ProcessAdPosition(adElemMoP, "MD", output))
+                {
+                    yield return item;
+                }
+            }
+        }
+    }
+
+    private IEnumerable<Row> ProcessAdPosition(DataSourceList adList, string Position, Row output)
+    {
+        for (int adNum = 0; adNum < adList.Count; adNum++)
+        {
+            var ad = adList[adNum];
+            FillImpressionColumns(ad, Position, adNum, output);
+
+            //parse the decorations for 1 ad
+            List<DecorationInfo> decorResult = new List<DecorationInfo>();
+
+            for (int i = 0; i < ad.Children.Count; i++)
+            {
+                var decorElem = ad.Children[i];
+                DecorationInfo oneDecorResult = ParseOneDecoration(decorElem);
+                if (oneDecorResult != null)
+                {
+                    decorResult.Add(oneDecorResult);
+                }
+            }
+            //output the decoration result
+            if (decorResult.Count == 0)
+            {
+                InitOutput(output);
+                yield return output;
+            }
+            else
+            { //output each decoration type
+                foreach (var decoration in decorResult)
+                {
+                    InitOutput(output);
+                    FillOneDecoration(output, decoration);
+                    yield return output;
+                }
+            }
+        }
+    }
+
+    private void FillImpressionColumns(DataSourceElement adElem, string PagePositionPrefix, int adNum, Row output)
+    {
+        // Fill up impression columns
+        output["PagePosition"].Set(PagePositionPrefix + (adNum + 1).ToString());
+
+        output["AdId"].Set(Convert.ToUInt64(adElem.GetDataPropertyOrDefault("AdId", "0")));
+        output["ListingId"].Set(Convert.ToUInt64(adElem.GetDataPropertyOrDefault("ListingId", "0")));
+        output["OfferId"].Set(adElem.GetDataPropertyOrDefault("OfferId", "0"));
+        output["OfferId64"].Set(Convert.ToUInt64(adElem.GetDataPropertyOrDefault("OfferId64", "0")));
+        output["Seller"].Set(adElem.GetDataPropertyOrDefault("DisplayUrl", ""));
+        output["ProductImageUrl"].Set(adElem.GetDataPropertyOrDefault("ProductImageUrl", ""));
+        output["Title"].Set(adElem.GetDataPropertyOrDefault("Title", ""));
+        output["OriginalPosition"].Set(adElem.GetDataPropertyOrDefault("OriginalPosition", ""));
+
+        float? imprDwellTime = null;
+        if (adElem.Clicks.Count > 0)
+        {
+            imprDwellTime = adElem.Clicks[0].DwellTimeClickInSecondsV2;
+        }
+        output["ImprDwellTime"].Set(imprDwellTime);
+
+        output["AdClicks"].Set(adElem.Clicks.Count);
+    }
+
+    private DecorationInfo ParseOneDecoration(DataSourceElement decorElem)
+    {
+        DecorationInfo result = new DecorationInfo();
+        string decType = decorElem.GetDataPropertyOrDefault("DecType", "");
+        if (!string.IsNullOrEmpty(decType))
+        {
+            result.decType = decType;
+            result.items = new List<DecorItemInfo>();
+            result.quickBackClicks = 0;
+
+            //Optional
+            result.dataSrceId = (DecorationInfo.DecorDataSrceId)(int.Parse(decorElem.GetDataPropertyOrDefault("DataSrceId", "0")));
+            // result.layout = decorElem.GetDataPropertyOrDefault("Layout", "");
+
+            var decorClickableItems = decorElem.FindElementsWithProperty("T", "D.Url");
+
+            if (decorClickableItems == null || decorClickableItems.Count == 0)
+            {
+                //CO, DCO, FourthLine, SmartCategory, SmartLPT, SS, Twitter, Badge
+                DecorItemInfo decorItem = new DecorItemInfo();
+                decorItem.text = SlapiUtils.Unbold(GetDataPropertyOrDefault(decorElem, new[] { "Text", "NarrowViewText", "StandardViewText" }, ""));
+                decorItem.decorItemClicks = 0;
+                result.items.Add(decorItem);
+            }
+
+            else
+            {
+                //MR, CR, FilterLink, SL, 
+                for (int itemIdx = 0; itemIdx < decorClickableItems.Count; itemIdx++)
+                {
+                    var clickableItem = decorClickableItems[itemIdx];
+                    DecorItemInfo decorItem = new DecorItemInfo();
+                    decorItem.isClickable = true;
+                    string isBillable = clickableItem.GetDataPropertyOrDefault("Billable", "");
+                    decorItem.isBillable = (isBillable == "true") ? true : false;
+                    decorItem.decorItemClicks = clickableItem.Clicks.Count;
+                    for (int clickIdx = 0; clickIdx < decorItem.decorItemClicks; clickIdx++)
+                    {
+                        if (clickableItem.Clicks[clickIdx].DwellTimeClickInSecondsV2.HasValue
+                            && clickableItem.Clicks[clickIdx].DwellTimeClickInSecondsV2.Value < 20)
+                        {
+                            result.quickBackClicks++;
+                        }
+                    }
+                    decorItem.url = clickableItem.GetDataPropertyOrDefault("Url", "");
+                    result.items.Add(decorItem);
+                }
+            }
+
+            return result;
+
+        }
+
+        return null;
+
+    }
+
+    private string GetDataPropertyOrDefault(DataSourceElement decorElem, string[] properyNames, string defaultValue)
+    {
+        var content = defaultValue;
+        foreach (var propertyName in properyNames)
+        {
+            content = decorElem.GetDataPropertyOrDefault(propertyName, defaultValue);
+            if (!string.IsNullOrEmpty(content) && content != defaultValue)
+            {
+                break;
+            }
+        }
+        return content;
+    }
+
+    private void FillOneDecoration(Row output, DecorationInfo decoration)
+    {
+        output["DecorType"].Set(decoration.decType);
+
+        if (decoration.dataSrceId != DecorationInfo.DecorDataSrceId.None)
+        {
+            output["DecorDataSourceId"].Set(decoration.dataSrceId.ToString());
+        }
+        else
+        {
+            output["DecorDataSourceId"].Set("");
+        }
+
+        int clicks = 0;
+        foreach (var decorItem in decoration.items)
+        {
+            clicks += decorItem.decorItemClicks;
+        }
+        output["DecorClicks"].Set(clicks);
+        output["DecorQBClicks"].Set(decoration.quickBackClicks);
+    }
+
+}
+#ENDCS

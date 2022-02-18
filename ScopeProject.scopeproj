@@ -1,0 +1,121 @@
+﻿<Project ToolsVersion="4.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
+    <SchemaVersion>2.0</SchemaVersion>
+    <ProjectGuid>fe68aea0-ad4c-4fb9-9f06-d01f2deb0aaf</ProjectGuid>
+    <OutputType>File</OutputType>
+    <AssemblyName>Algebra.xml</AssemblyName>
+    <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
+    <TargetFrameworkVersion>v4.5</TargetFrameworkVersion>
+    <Name>ScopeProject</Name>
+    <RootNamespace>ScopeProject</RootNamespace>
+    <VCSelectionInProjectProperty>vc://cosmos08/bingAds.BI.OI</VCSelectionInProjectProperty>
+    <CosmosRuntimeVersion>Default</CosmosRuntimeVersion>
+    <ScopePath>%24(SCRIPT_DIR);%24(CLUSTER_ROOT);%24(SCOPE_DIR);%24(PROJECT_DIR)</ScopePath>
+    <InputStreamSearchPath>%24(PROJECT_DIR);%24(SCRIPT_DIR);%24(CLUSTER_ROOT)</InputStreamSearchPath>
+    <VertexDebugSolution>false</VertexDebugSolution>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
+    <DebugSymbols>true</DebugSymbols>
+    <OutputPath>bin\Debug\</OutputPath>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+    <DebugSymbols>false</DebugSymbols>
+    <OutputPath>bin\Release\</OutputPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <Script Include="ComparisonExtension.script">
+      <RemoveUselessParameters>False</RemoveUselessParameters>
+      <ScopeOldParameters>startDateTime=(\"2021-12-20T00:00:00.0000000Z\")</ScopeOldParameters>
+      <ScopeClusterParameters>startDateTime=(\"2021-12-20T00:00:00.0000000Z\")</ScopeClusterParameters>
+    </Script>
+    <Script Include="ExpLatencyAnalysis.script" />
+    <Script Include="FixDataSourceId.script">
+      <RemoveUselessParameters>False</RemoveUselessParameters>
+      <ScopeOldParameters>startDateTime=(\"2022-01-14T00:00:00.0000000Z\")</ScopeOldParameters>
+      <ScopeClusterParameters>startDateTime=(\"2022-01-14T00:00:00.0000000Z\")</ScopeClusterParameters>
+    </Script>
+    <Script Include="PADecorationCoverageFromRichAdsView-NoFlight.script">
+      <RemoveUselessParameters>True</RemoveUselessParameters>
+      <ScopeOldParameters>startDateTime=(\"2021-12-22T00:00:00.0000000Z\")</ScopeOldParameters>
+      <ScopeClusterParameters>startDateTime=(\"2021-12-20T00:00:00.0000000Z\")</ScopeClusterParameters>
+    </Script>
+    <Script Include="PA_MV_Flatten.script">
+      <RemoveUselessParameters>False</RemoveUselessParameters>
+      <ScopeOldParameters>JOB_Date=(\"2021-12-17\")</ScopeOldParameters>
+    </Script>
+    <Script Include="PA_MV_unpivot_v2.script" />
+    <Script Include="PADecorationCoverageFromRichAdsView.script">
+      <RemoveUselessParameters>False</RemoveUselessParameters>
+      <ScopeOldParameters>JOB_Date=(\"2021-11-30\")</ScopeOldParameters>
+      <ScopeClusterParameters>JOB_Date=(\"2021-11-30\")</ScopeClusterParameters>
+    </Script>
+    <Script Include="PA_MV_pivot.script">
+      <RemoveUselessParameters>False</RemoveUselessParameters>
+      <ScopeOldParameters>JOB_Date=(\"2021-11-15\")</ScopeOldParameters>
+      <ScopeClusterParameters>JOB_Date=(\"2021-11-15\")</ScopeClusterParameters>
+    </Script>
+    <Script Include="PA_MV_unpivot.script">
+      <RemoveUselessParameters>False</RemoveUselessParameters>
+      <ScopeOldParameters>JOB_Date=(\"2021-11-15\")</ScopeOldParameters>
+      <ScopeClusterParameters>JOB_Date=(\"2021-11-15\")</ScopeClusterParameters>
+    </Script>
+    <Script Include="PA_SLAPI.script">
+      <RemoveUselessParameters>False</RemoveUselessParameters>
+      <ScopeOldParameters>JOB_Date=(\"2021-11-22\")</ScopeOldParameters>
+      <ScopeClusterParameters>JOB_Date=(\"2021-11-22\")</ScopeClusterParameters>
+    </Script>
+    <Script Include="PA_SLAPI_Flatten.script">
+      <RemoveUselessParameters>False</RemoveUselessParameters>
+      <ScopeOldParameters>JOB_Date=(\"2021-11-30\")</ScopeOldParameters>
+      <ScopeClusterParameters>JOB_Date=(\"2021-12-17\")</ScopeClusterParameters>
+    </Script>
+    <Script Include="ReliabilityComparison.script">
+      <RemoveUselessParameters>True</RemoveUselessParameters>
+      <ScopeOldParameters>startDateTime=(\"2022-01-15T00:00:00.0000000Z\")</ScopeOldParameters>
+      <ScopeClusterParameters>startDateTime=(\"2021-12-18T00:00:00.0000000Z\")</ScopeClusterParameters>
+    </Script>
+    <Script Include="SaleBadgeExpAnalysis.script" />
+    <ScriptCode Include="ComparisonExtension.script.cs">
+      <DependentUpon>ComparisonExtension.script</DependentUpon>
+    </ScriptCode>
+    <ScriptCode Include="ExpLatencyAnalysis.script.cs">
+      <DependentUpon>ExpLatencyAnalysis.script</DependentUpon>
+    </ScriptCode>
+    <ScriptCode Include="FixDataSourceId.script.cs">
+      <DependentUpon>FixDataSourceId.script</DependentUpon>
+    </ScriptCode>
+    <ScriptCode Include="PADecorationCoverageFromRichAdsView-NoFlight.script.cs">
+      <DependentUpon>PADecorationCoverageFromRichAdsView-NoFlight.script</DependentUpon>
+    </ScriptCode>
+    <ScriptCode Include="PA_MV_Flatten.script.cs">
+      <DependentUpon>PA_MV_Flatten.script</DependentUpon>
+    </ScriptCode>
+    <ScriptCode Include="PA_MV_unpivot_v2.script.cs">
+      <DependentUpon>PA_MV_unpivot_v2.script</DependentUpon>
+    </ScriptCode>
+    <ScriptCode Include="PADecorationCoverageFromRichAdsView.script.cs">
+      <DependentUpon>PADecorationCoverageFromRichAdsView.script</DependentUpon>
+    </ScriptCode>
+    <ScriptCode Include="PA_MV_pivot.script.cs">
+      <DependentUpon>PA_MV_pivot.script</DependentUpon>
+    </ScriptCode>
+    <ScriptCode Include="PA_MV_unpivot.script.cs">
+      <DependentUpon>PA_MV_unpivot.script</DependentUpon>
+    </ScriptCode>
+    <ScriptCode Include="PA_SLAPI.script.cs">
+      <DependentUpon>PA_SLAPI.script</DependentUpon>
+    </ScriptCode>
+    <ScriptCode Include="PA_SLAPI_Flatten.script.cs">
+      <DependentUpon>PA_SLAPI_Flatten.script</DependentUpon>
+    </ScriptCode>
+    <ScriptCode Include="ReliabilityComparison.script.cs">
+      <DependentUpon>ReliabilityComparison.script</DependentUpon>
+    </ScriptCode>
+    <ScriptCode Include="SaleBadgeExpAnalysis.script.cs">
+      <DependentUpon>SaleBadgeExpAnalysis.script</DependentUpon>
+    </ScriptCode>
+  </ItemGroup>
+  <Import Project="$(AppData)\Microsoft\ScopeStudio\MsBuild\1.0\Scope.targets" />
+</Project>

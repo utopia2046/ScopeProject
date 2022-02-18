@@ -1,0 +1,623 @@
+﻿//Script GUID:9ca02cdf-d3b1-4d3a-816b-caf727133940
+//Used for tracking history
+#DECLARE UtcTimeSuffix string = @"T00:00:00.0000000Z";
+#DECLARE StartDateTimeUtc DateTime = DateTime.Parse(@@JOB_Date@@); // JOB_Date should be like yyyy-MM-dd
+#DECLARE EndDateTimeUtc DateTime = @StartDateTimeUtc.AddDays(1);
+
+USING Microsoft.AdPredictor.ScopeUtils REFERENCE @ScopeUtilDll;
+
+#DECLARE FltNumberLine string = @"AdsFLN4";
+#DECLARE FlightId string = @"31172";
+#DECLARE Market string = "en-US";
+#DECLARE LogDate string = @StartDateTimeUtc.ToString("yyyy-MM-dd");
+#DECLARE Outpath string = String.Format("/local/AdsOI/SERP/MV/{0}/{1:D2}", @StartDateTimeUtc.Year, @StartDateTimeUtc.Month);
+#DECLARE OuputStat string = String.Format("{0}/MVDump_PAExtensions_Stat_{1}.ss", @Outpath, @LogDate);
+#DECLARE OuputCore string = String.Format("{0}/MVDump_PAExtensions_Core_{1}.ss", @Outpath, @LogDate);
+
+MonetizationView = VIEW "/shares/adCenter.BICore.SubjectArea/SubjectArea/Monetization/views/PROD/MonetizationFacts.view"
+    PARAMS 
+    (
+        StartDateTimeUtc = @StartDateTimeUtc,
+        EndDateTimeUtc = @EndDateTimeUtc,
+
+        ReadAdImpressions  = true,
+        ReadClicks         = true,
+        ReadPageViews      = false,
+        ReadConversions    = false,
+        ReadSessions       = false,
+        UnpivotAdExtension = true
+    );
+
+MonetizationView = 
+    SELECT * 
+    FROM MonetizationView 
+    WHERE IsFraud == false
+        AND AdDisplayTypeId == 5                // ProductAd
+        AND MarketplaceClassificationId == 1    // Bing.com exclude Bing.com/images
+        AND CampaignId > 0
+        AND AdvertiserAccountId > 0
+        AND CustomerId > 0
+        AND AdId != NULL
+        AND OrderItemId != NULL
+    ;
+
+MonetizationView = 
+    SELECT
+        RGUID,
+        AdId,
+        OrderItemId AS ListingId,
+        ClickId,
+        PagePosition,
+
+        Converter.ParseFlightNumber(FlightInfoRecordList, "AdsFLN4") AS FlightId,
+        IF(string.IsNullOrEmpty(AdLanguage) || string.IsNullOrEmpty(WebsiteCountry), null, AdLanguage + "-" + WebsiteCountry) AS Market,
+
+        MBDate AS UtcTime,
+        AdExtensionTypeId,
+        ImpressionCnt AS Impressions, 
+        ClickCnt AS Clicks,
+        IF (AmountChargedUSDMonthlyExchangeRt > 0, AmountChargedUSDMonthlyExchangeRt, (decimal)0.0) AS Revenue,
+
+        ScopeArray.Create(ARRAY_AGG(ImpressionCnt > 0 ? AdExtensionTypeId : (short?)null).Where(e => e.HasValue).Select(e => e.Value)) AS DecorTypeIds
+    FROM MonetizationView 
+    ; 
+
+        (IsFraud == false) AND
+        (AdDisplayTypeId == 5) AND               // PA
+        (MarketplaceClassificationId == 1) AND   // Bing.com exclude Bing.com/images
+//        FlightNum == ("" + @FlightId),      // 31172 is control flight
+//        !string.IsNullOrEmpty(Market) AND Market.Equals(@Market.ToLower(), StringComparison.OrdinalIgnoreCase), // en-us only
+        (PagePosition.StartsWith("ML") OR PagePosition.StartsWith("SB") OR PagePosition.StartsWith("PO") OR PagePosition.StartsWith("MD"))
+    ;
+
+
+DataGr =
+    SELECT RGUID,
+           PageViewCnt,
+           ImpressionCnt,
+           ClickCnt,
+           PagePositionId,
+
+           PagePosition,
+           (bool?) IsFraud AS IsFraud,
+
+           AdId,
+           OrderId,
+           OrderItemId AS ListingId,
+           DomainSpecificId,
+           UniqueAdListingId,
+           (uint?) CampaignTypeId AS CampaignTypeId,
+           ListingAdInfo,
+
+           AmountChargedUSDMonthlyExchangeRt AS Revenue,
+
+           MBDate AS UtcTime,
+
+           QueryPhrase,
+           NonNormalizedQueryString AS RawQuery,
+           BiddedKeyword,
+           MatchTypeId,
+
+           RelatedToAccountId,
+           MarketplaceClassificationId,
+           MediumId,
+           DeviceTypeId,
+           DistributionChannelId,
+           FormCode,
+           FormCodeClassification,
+           WebsiteCountry,
+           AdLanguage,
+           TrafficPartitionCode,
+           LanguageCode,
+           QueryCategorizations,
+           AdScenarioType,
+           SubMatchTypeId,
+           AdScenarioFeedId,
+           AdScenarioFeedItemId,
+           AdScenarioFeedSourceId,
+
+           CustomerId,
+           AdvertiserAccountId,
+           CampaignId,
+           AdGroupId,
+           IncomingPublisherWebSiteCountry,
+           TargetTypeId,
+           DataCenterId,
+
+           DomainType,
+           AdDisplayTypeId,
+
+           RelevanceScore,
+           RankScore,
+           ProbabilityOfClick AS AHpClick,
+
+           Tools.ParseFlightNumber(FIRST(FlightInfoRecordList), "AdsFLN0") AS Flight_adsfln0,
+           Tools.ParseFlightNumber(FIRST(FlightInfoRecordList), "AdsFLN1") AS Flight_adsfln1,
+           Tools.ParseFlightNumber(FIRST(FlightInfoRecordList), "AdsFLN4") AS Flight_adsfln4,
+           Tools.ParseFlightNumber(FIRST(FlightInfoRecordList), "AdsFLN7") AS Flight_adsfln7,
+           Tools.ParseFlightNumber(FIRST(FlightInfoRecordList), "AdsFLN9") AS Flight_adsfln9,
+           FIRST(FlightInfoRecordList) AS FlightInfoRecordList,
+
+           string.Join(",", LIST((ImpressionCnt > 0 ? AdExtensionTypeId.ToString() : "") +
+                                    (ImpressionCnt > 0 && AdExtensionRenderedLayoutId != 0 ? "-" + AdExtensionRenderedLayoutId.ToString() : "") ).
+                            Where(id => !string.IsNullOrEmpty(id) && id != "0")) AS DecorTypeIds_old, // Format: ExtentionId-RenderedLayoutId
+
+           ScopeArray.Create(ARRAY_AGG(ImpressionCnt > 0 ? AdExtensionTypeId : (short?)null).Where(e => e.HasValue).Select(e => e.Value)) AS DecorTypeIds,
+           ScopeArray.Create(ARRAY_AGG(ImpressionCnt > 0 ? AdExtensionRenderedLayoutId : (ushort?)null).Where(e => e.HasValue).Select(e => e.Value)) AS DecorRenderedLayouts,
+           ScopeArray.Create(ARRAY_AGG(ImpressionCnt > 0 ? AdExtensionGroupId : (short?)null).Where(e => e.HasValue).Select(e => e.Value)) AS DecorGroupIds,
+           
+           ScopeArray.Create(ARRAY_AGG(ImpressionCnt > 0 ? AdExtensionNotDisplayedReason : (byte?)null).Where(e => e.HasValue).Select(e => e.Value)) AS DecorNotDisplayedReasons,
+           ScopeArray.Create(ARRAY_AGG(ImpressionCnt > 0 ? AdExtensionItemNotDisplayedReason : (byte?)null).Where(e => e.HasValue).Select(e => e.Value)) AS DecorItemNotDisplayedReasons,
+
+           ScopeArray.Create(ARRAY_AGG(ImpressionCnt > 0 ? AdExtensionTokenId : (ushort?)null).Where(e => e.HasValue).Select(e => e.Value)) AS DecorTokenIds,
+           ScopeArray.Create(ARRAY_AGG(ImpressionCnt > 0 ? AdExtensionItemTokenId : (ushort?)null).Where(e => e.HasValue).Select(e => e.Value)) AS DecorItemTokenIds,
+
+           ScopeArray.Create(ARRAY_AGG(ClickCnt > 0 ? AdExtensionTypeId : (short?)null).Where(e => e.HasValue).Select(e => e.Value)) AS DecorClicksTypeIds
+    FROM MVData;
+
+FlightData =
+    SELECT DISTINCT
+            RGUID,
+            AdId,
+            OrderId,
+            ListingId,
+            CustomerId,
+            AdvertiserAccountId,
+            CampaignId,
+            AdGroupId,
+            RelatedToAccountId,
+            MarketplaceClassificationId,
+            MediumId,
+            DistributionChannelId,
+            Tools.IsRelatedToYahoo(RelatedToAccountId, MarketplaceClassificationId, MediumId, DistributionChannelId) AS IsYahooRelated,
+
+            PageViewCnt,
+            ImpressionCnt,
+            ClickCnt,
+            Revenue,
+            PagePosition.StartsWith("PO") ? ImpressionCnt : 0 AS POImpressionCnt,
+            PagePosition.StartsWith("ML") ? ImpressionCnt : 0 AS MLImpressionCnt,
+            PagePosition.StartsWith("MD") ? ImpressionCnt : 0 AS MDImpressionCnt,
+            PagePosition.StartsWith("SB") ? ImpressionCnt : 0 AS SBImpressionCnt,
+
+            PagePosition,
+            ((PagePosition.Length >2)? PagePosition.Substring(0,2):PagePosition) AS AdPosition,
+            UtcTime,
+            UtcTime.HasValue? TimeZoneInfo.ConvertTimeFromUtc(UtcTime.Value,
+                        TimeZoneInfo.FindSystemTimeZoneById("Pacific Standard Time")) : (DateTime?) null AS PstTime,
+
+            QueryPhrase,
+            RawQuery,
+            BiddedKeyword,
+            DataCenterId,
+            RankScore,
+            RelevanceScore,
+            AHpClick,
+
+            DeviceTypeId,
+            WebsiteCountry,
+            AdLanguage,
+            Flight_adsfln4 AS FlightNum,
+
+            DecorTypeIds_old,
+
+            // Decorations
+            DecorTypeIds.Contains(52) ? 1 : 0 AS Decor_MerchantPromotion_Impr, // SpecialOffer
+            DecorTypeIds.Contains(56) ? 1 : 0 AS Decor_LocalInventoryExtension_Impr,
+
+            DecorTypeIds.Contains(16134) ? 1 : 0 AS Decor_PABadge_Impr,
+            DecorTypeIds.Contains(16135) ? 1 : 0 AS Decor_ConditionAnnotation_Impr, // Refurbished
+            DecorTypeIds.Contains(16250) ? 1 : 0 AS Decor_EliteBadge_Impr, // MerchantRating
+            DecorTypeIds.Contains(16251) ? 1 : 0 AS Decor_PriceDropAlert_Impr,
+            DecorTypeIds.Contains(16252) ? 1 : 0 AS Decor_ProductRating_Impr,
+            DecorTypeIds.Contains(16253) ? 1 : 0 AS Decor_FreeShipping_Impr,
+            DecorTypeIds.Contains(16254) ? 1 : 0 AS Decor_ThreeDimensionalProductAds_Impr, // ImageOverlay
+            DecorTypeIds.Contains(16257) ? 1 : 0 AS Decor_BrandLoyalty_Impr,
+            DecorTypeIds.Contains(16260) ? 1 : 0 AS Decor_AttributeAnnotation_Impr, // TopSold
+            DecorTypeIds.Contains(16262) ? 1 : 0 AS Decor_TopVisitedAnnotation_Impr, // TopViewed
+            DecorTypeIds.Contains(16264) ? 1 : 0 AS Decor_PAVisitedLinksAnnotation_Impr,
+            DecorTypeIds.Contains(16268) ? 1 : 0 AS Decor_PriceDropAlertBadge_Impr,
+            DecorTypeIds.Contains(16270) ? 1 : 0 AS Decor_FreeReturns_Impr,
+            DecorTypeIds.Contains(16271) ? 1 : 0 AS Decor_SaleBadge_Impr,
+            DecorTypeIds.Contains(16272) ? 1 : 0 AS Decor_SaleExtension_Impr,
+            DecorTypeIds.Contains(16273) ? 1 : 0 AS Decor_PAShortTitle_Impr,
+            DecorTypeIds.Contains(16275) ? 1 : 0 AS Decor_PAImageAnnotation_Impr,
+            DecorTypeIds.Contains(16278) ? 1 : 0 AS Decor_PABusinessAttributes_Impr
+    FROM DataGr;
+
+FlightData = SELECT * FROM FlightData WHERE AdPosition IN ("PO", "ML", "MD","SB");
+
+MvStat =
+    SELECT
+        @LogDate AS LogDate,
+        IsYahooRelated,
+        PagePosition,
+        AdPosition,
+        DeviceTypeId,
+        WebsiteCountry,
+        AdLanguage,
+        FlightNum,
+        SUM(PageViewCnt) AS TotalPageViews,
+        SUM(ImpressionCnt) AS TotalImpressions,
+        SUM(POImpressionCnt) AS PoleImpressions,
+        SUM(MLImpressionCnt) AS MainlineImpressions,
+        SUM(MDImpressionCnt) AS MiddleImpressions,
+        SUM(SBImpressionCnt) AS SidebarImpressions,
+        SUM(ClickCnt) AS TotalClicks,
+        SUM(Revenue) AS TotalRevenue,
+        SUM(Decor_MerchantPromotion_Impr) AS MerchantPromotion,
+        SUM(Decor_LocalInventoryExtension_Impr) AS LocalInventory,
+        SUM(Decor_PABadge_Impr) AS PriceDropBadge,
+        SUM(Decor_ConditionAnnotation_Impr) AS ConditionAnnotation,
+        SUM(Decor_EliteBadge_Impr) AS EliteBadge,
+        SUM(Decor_PriceDropAlert_Impr) AS PriceDrop,
+        SUM(Decor_ProductRating_Impr) AS ProductRating,
+        SUM(Decor_FreeShipping_Impr) AS FreeShipping,
+        SUM(Decor_ThreeDimensionalProductAds_Impr) AS ImageOverlay,
+        SUM(Decor_BrandLoyalty_Impr) AS BrandLoyalty,
+        SUM(Decor_AttributeAnnotation_Impr) AS TopSold,
+        SUM(Decor_TopVisitedAnnotation_Impr) AS TopViewed,
+        SUM(Decor_PAVisitedLinksAnnotation_Impr) AS VisitedLink,
+        SUM(Decor_FreeReturns_Impr) AS FreeReturns,
+        SUM(Decor_SaleBadge_Impr) AS SaleBadge,
+        SUM(Decor_SaleExtension_Impr) AS SaleExtension,
+        SUM(Decor_PAShortTitle_Impr) AS ShortTitle,
+        SUM(Decor_PAImageAnnotation_Impr) AS ImageAnnotation,
+        SUM(Decor_PABusinessAttributes_Impr) AS BusinessAttribute
+    FROM FlightData
+    GROUP BY
+        LogDate,
+        IsYahooRelated,
+        PagePosition,
+        AdPosition,
+        DeviceTypeId,
+        WebsiteCountry,
+        AdLanguage,
+        FlightNum
+;
+
+OUTPUT MvStat
+TO SSTREAM @OuputStat
+WITH STREAMEXPIRY "180";
+
+ResultNewCore =
+    SELECT *
+    FROM FlightData
+    WHERE RelatedToAccountId == 1004
+          AND WebsiteCountry == "us"
+          AND AdLanguage == "en"
+          AND MarketplaceClassificationId == 1
+          AND (MediumId == 1 OR MediumId == 3)
+          AND DistributionChannelId == 1;
+
+OUTPUT ResultNewCore TO SSTREAM @OuputCore
+    CLUSTERED BY RGUID, QueryPhrase
+    SORTED BY RGUID, QueryPhrase
+    WITH STREAMEXPIRY "30";
+
+// ----------------------------------------------------------------------------------------------------------------------
+#CS
+using Microsoft.SCOPE.Types;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using ScopeRuntime;
+
+public static class Converter
+{
+    public enum DecorationTypes
+    {
+        None = 0,
+
+        // MerchantRatings = 1 [In BI, MR islogged as 1], OfficialSites = 2 [Old UX Id, do not reuse], HotelRatings = 3 [Old UX Id, do not reuse], TopAd = 4 [Old UX Id, do not reuse],
+        SiteLinkExtension = 10,
+        LocationExtension = 11,
+        CallExtension = 12,
+        ProductExtension = 13,
+        MeteredCallExtension = 14,
+        MerchantRatings = 15,
+        DescriptionLAT = 16,
+        DisplayUrlLAT = 17,
+        LocalLAT = 18,
+        DescriptionAndURLLAT = 19,
+        OriginalLAT = 20,
+        DynamicLAT = 21,
+        OfficialSiteLAT = 22,
+        SnapshotAnnotation = 23,
+        EntityPeekRichAnnotation = 24,
+        SmartAnnotation = 25,
+        OfficialSiteBadge = 27,
+        AdCreativeAnnotation = 30,
+        SocialAdExtension = 34,
+        ImageAdExtension = 35,
+        EnhancedSitelinks = 36,
+        ProductCatalog = 37,
+        AppExtension = 38,
+        ReviewExtension = 39,
+        ActionsExtension = 40,
+        FormExtension = 41,
+        CalloutExtension = 42,
+        BlackBoxWarningExtension = 43,
+        DisclosureExtension = 44,
+        TableExtension = 45,
+        VideoExtension = 46,
+        SocialExtension = 47,
+        TabExtension = 48,
+        DynamicProductExtension = 50,
+        StructuredSnippetExtension = 51,
+        MerchantPromotion = 52,
+        FilterLinkExtension = 53,
+        FlyerExtension = 54,
+        PriceExtension = 55,
+        LocalInventoryExtension = 56,
+        PromotionExtension = 57,
+        AffiliateLocationExtension = 58,
+        DynamicDataExtension = 59,
+        AutomatedFilterLink = 16119,
+        FilterLinkBackfill = 16108,
+        SLAB = 16001,
+        Twitter = 16002,
+        DUDE = 16003,
+        TopAds = 16004,
+        FaviconAnnotations = 16005,
+        MerchantRatingLAT = 16006,
+        LandingPageTitleLAT = 16007,
+        DomainURLLAT = 16008,
+        LocationLAT = 16009,
+        SiteLinkOptimization = 16010,
+        SmartLandingPageTitle = 16011,
+        ConsumerRating = 16012,
+
+        // Personalization is DEPRECATED. Please don't use it anywhere.
+        Personalization = 16013,
+        PreviousVisit = 16013,
+        ClickToCallLAT = 16015,
+        ThirdPartyUserPersonalization = 16016,
+        VisitedLinks = 16017,
+        FourthLine = 16018,
+        Brand = 16019,
+        LPPhrasesLAT = 16021,
+        QueryLAT = 16022,
+        RelatedProducts = 16023,
+        LPPhraseLATV2 = 16024,
+        ConsumerSentiment = 16025,
+        PopOutAnnotation = 16026,
+        SmartCategory = 16027,
+        PersonalizedRecommendation = 16029,
+        EntityDescriptionAnnotation = 16030,
+        QueryLATV2 = 16031,
+        LongDescription = 16032,
+        DynamicDescription = 16034,
+        DescriptionFactLAT = 16035,
+        SmartLandingPageList = 16036,
+        BrandLAT = 16037,
+        ESLLAT = 16038,
+        KeywordLAT = 16039,
+        AutomatedImageExtension = 16040,
+        BrandLogo = 16041,
+        ImageDataSourceFromMSAN = 16042,
+        BrandAnnotationAsLAT = 16044,
+        ESLBackFill = 16046,
+        Badge = 16050,
+        SecurityBadge = 16051,
+        LandingPageMetaKWLAT = 16052,
+        BingSnippetAnnotation =16053,
+        ActionsExtensionFromAdsLab = 16054,
+        CalloutLAT = 16055,
+        DynamicProductExtensionFromAdslab = 16056,
+        DynamicProductExtensionPersonalized = 16057,
+        CategoryBadge=16058,
+        SiteSearchAnnotation=16059,
+        BingNextActionAnnotation=16060,
+        ChatExtension = 16062,
+        DescriptionSummaryLAT = 16063,
+        FilterLink = 16064,
+        FilterLinkFromAdslab = 16065,
+        DescriptionShuffleLAT = 16066,
+        PopularQueryLAT = 16067,
+        LongDescriptionTwoLine = 16068,
+        FormAnnotation = 16069,
+        BingPlaces = 16070,
+        LocationExtensionGetARide = 16072,
+        DomainKeywordLAT = 16073,
+        DomainCalloutLAT = 16074,
+        FlyerFromPA = 16075,
+        DynamicTitle = 16076,
+        ExtensionLATOptOut = 16077,
+        HotelRating = 16078,
+        MetaDescriptionAnnotation = 16079,
+        MobileFriendlyAnnotation = 16080,
+        CalloutExtensionFromAdsLab = 16081,
+        DynamicCalloutAnnotation = 16082,
+        DescriptionSummaryDisplayUrlLAT = 16083,
+        PromotionAnnotation = 16084,
+        HighCTRSnippetAnnotation = 16086,
+        EventAnnotation = 16087,
+        HighPrecisionLPSnippet = 16088,
+        CustomerServiceCallAnnotation = 16089,
+        StellaReviewBackfill = 16090,
+        ReviewExtensionFromAdsLab = 16091,
+        DynamicMapLocations = 16092,
+        BoldedAdTitle = 16094,
+        AutomatedDynamicProductExtension = 16095,
+        ChatBotAnnotation = 16097,
+        AffiliateStoreLocations = 16098,
+        PromotionExtensionFromAdsLab = 16099,
+        AutomatedPromotionExtension = 16100,
+        ExTATitle1 = 16101,
+        ExTATitle2 = 16102,
+        DealBadge = 16103,
+        ShippingBadge = 16105,
+        AffiliateLocationExtensionFromAdsLab = 16106,
+        VerticalAdsMetadata = 16109,
+        AddressLAT = 16110,
+        AdslabFlyerExtensionFromCreative = 16111,
+        AdslabActionExtensionFromCreative = 16112,
+        CoAccountLAT = 16113,
+        PriceLAT = 16114,
+        AppInstallCategory = 16115,
+        AppInstallPrice = 16116,
+        AppInstallRating = 16117,
+        DescriptionOverride = 16118,
+        DynamicPromotionExtension = 16120,
+        PASmartCategory  = 16121,
+        DynamicPriceExtension = 16122,
+        PriceAnnotationTours = 16123,
+        DynamicAppInstallCategory = 16125,
+        DynamicAppInstallPrice = 16126,
+        DynamicAppInstallRating = 16127,
+        HttpsUXFeature = 16128,
+        AdTitle3 = 16129,
+        AdDescription1 = 16130,
+        AdDescription2 = 16131,
+        TourActivityAdsMetadata = 16132,
+        DealsAnnotation = 16133,
+        PABadge = 16134,
+        ConditionAnnotation = 16135,
+        DynamicDataBackfill = 16136,
+        AutomatedDynamicDataExtension = 16137,
+        OfficialSiteAnnotation = 16138,
+        PremiumCustomer = 16139,
+        DealsBadge = 16140,
+        CountryOfOriginBadge = 16141,
+        ActionLinkBackfill = 16142,
+        DealsActionLinkBackfill = 16143,
+        DeepGenLAT = 16144,
+        FilterLinksFromBreadcrumb = 16145,
+        TitleSeparator = 16146,
+        SyndicationAnnotation = 16147,
+        DisplayUrlOverride = 16148,
+        TitleOverride = 16149,
+        AutoAdsMetadata = 16150,
+        LocalBusinessAdsMetadata = 16151,
+        DisplayUrlSuffix = 16153,
+        DynamicDataAccommodations = 16154,
+	    StorePickupBadge = 16155,
+        PickupDeliveryLAT = 16156,
+	    CoCampaignDesc = 16157,
+        DDEBackfillFromHPA = 16158,
+        LPExtractorPlusLAT = 16160,
+        PersonalizedBrandLAT = 16162,
+        FacebookBadge = 16163,
+        TitleAsset = 16164,
+        DescriptionAsset = 16165,
+        TitleOptions = 16166,
+        DescriptionOptions = 16167,
+        DefaultAdCopy  = 16168,
+        BSAActionBackfill = 16169,
+        CreditCardAdsMetadata = 16170,
+        DynamicSocialExtension = 16171,
+        SocialAwarenessBadge = 16172,
+        BusinessAttributes = 16173,
+        WhiteGloveCampaigns = 16200,
+        WhiteGlovePersonalizedOffers = 16201,
+        WhiteGlovePersonalizedOffersTableOutput = 16202,
+        TableExtensionTestInput = 16204,
+        HotelAnnotation = 16205,
+        TableExtensionFeedMetata = 16206,
+        DynamicTableExtension = 16207,
+        RichAdsPersonalizationMetadata = 16208,
+        OfferExtension = 16210,
+        TrendingSearch = 16211,
+        ESLGenericText = 16212,
+        SloganAnnotation = 16213,
+        PersonalizedLAT = 16215,
+        HotelAmenities = 16216,
+        DSAFilterlinkBackfill = 16217,
+        EliteBadge = 16250,
+        PriceDropAlert = 16251,
+        ProductRating = 16252,
+        FreeShipping = 16253,
+        ThreeDimensionalProductAds = 16254,
+        PAOfficialSiteAnnotation = 16255,
+        HPAOfficialSiteAnnotation = 16256,
+        BrandLoyalty = 16257,
+        HPAPriceDrop = 16258,
+        FirstPAPromotion = 16259,
+        AttributeAnnotation = 16260,
+        AttributeAnnotationDatasource = 16261,
+        TopVisitedAnnotation = 16262,
+        TopVisitedAnnotationDatasource = 16263,
+        PAVisitedLinksAnnotation = 16264,
+        PAVisitedLinksAnnotationDatasource = 16265,
+        PriceDropAlertBadge = 16268,	
+        FreeReturnsDatasource = 16269,
+        FreeReturns = 16270,
+        SaleBadge = 16271,
+        SaleExtension = 16272,
+        PAShortTitle = 16273,
+        PAShortTitleDataSource = 16274,
+        PAImageAnnotation = 16275,
+        PAImageAnnotationDataSource = 16276,
+        AddToCart = 16277,
+        PABusinessAttributes = 16278,
+        PABrandLogo = 16279,
+        PABrandLogoDataSource = 16280, 
+        BestLATDomain = 16298,
+        BestLATAdListing = 16299,
+        EntityPaneMap = 16301,
+
+        // DecorationTypes used to represent media asset types
+        AssetLandscapeImageMedia = 16400,
+        AssetSquareImageMedia = 16401,
+        AssetLandscapeLogoMedia = 16402,
+        AssetSquareLogoMedia = 16403,
+        AssetImageMedia169X100 = 16404,
+        AssetImageMedia93X100 = 16405,
+        AssetImageMedia15X10 = 16406,
+        AssetImageMedia155X100 = 16407,
+        AssetImageMedia133X100 = 16408,
+        AssetImageMedia178X100 = 16409,
+        AssetImageMedia172X100 = 16410,
+        AssetImageMedia1X2 = 16411,
+        AssetImageMedia4X1 = 16412,
+        AssetResponsiveAdHeadlines = 16413,
+        AssetResponsiveAdLongHeadlines = 16414,
+        AssetResponsiveAdDescriptions = 16415,
+        AssetMMACallToAction = 16416,
+
+        // This decoration type represents the dummy extension generated for 
+        // cash back scenario (similar to media asset types above)
+        AdvertiserPromotion = 16450,
+
+        // GetARideInLocationExtension and FilterLink are DEPRECATED. Please don't use it anywhere.
+        GetARideInLocationExtension=16702,
+
+        // Used to indicate to UX which types are not opted out by advertiser
+        UXExperiment = 18000,
+
+        // Used to opt-out ThinAds Experience
+        ThinAd = 19000,
+    };
+
+    public static string ConvertTypeIdToName(short TypeId)
+    {
+        DecorationTypes decorType = (DecorationTypes)TypeId;
+        string result = decorType.ToString();
+        return result;
+    }
+
+    public static string ParseFlightInfoRecordList(string FlightInfoRecordList, string LineID)
+    {
+        if (string.IsNullOrEmpty(FlightInfoRecordList))
+            return (string)null;
+        string str1 = "";
+        int num = FlightInfoRecordList.IndexOf(LineID + "|");
+        if (num > -1)
+        {
+            string str2 = FlightInfoRecordList.Substring(num + LineID.Length + 1);
+            if (str2.IndexOf("|") > -1)
+                str1 = str2.Substring(0, str2.IndexOf("|"));
+        }
+        return str1;
+    }
+
+    public static int? ParseFlightNumber(string FlightInfoRecordList, string LineID)
+    {
+        string flightInfoRecordList = ParseFlightInfoRecordList(FlightInfoRecordList, LineID);
+        int result = -1;
+        return int.TryParse(flightInfoRecordList, out result) ? new int?(result) : new int?();
+    }
+}
+#ENDCS

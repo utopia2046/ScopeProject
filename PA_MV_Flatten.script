@@ -1,0 +1,163 @@
+﻿//Script GUID:d86faf22-0218-471f-9e77-94ff4ef0d3fc
+//Used for tracking history
+#DECLARE PstTimeSuffix string = @" 0:00:00 AM -08:00";
+#DECLARE DateFormat string = @"yyyy-MM-dd";
+#DECLARE StartTimePst DateTime = DateTime.Parse(@@JOB_Date@@ + @PstTimeSuffix); // JOB_Date should be like yyyy-MM-dd or M/dd/yyyy
+#DECLARE EndTimePst DateTime = @StartTimePst.AddDays(1);
+#DECLARE StartDateStringPst string = @StartTimePst.ToString(@DateFormat);       // Slapi view accepts date string in PST
+#DECLARE EndDateStringPst string = @EndTimePst.ToString(@DateFormat);
+#DECLARE StartTimeUtc DateTime = @StartTimePst.ToUniversalTime();               // MZ view accepts DateTime in UTC
+#DECLARE EndTimeUtc DateTime = @EndTimePst.ToUniversalTime();
+
+#DECLARE FltNumberLine string = @"AdsFLN4";
+#DECLARE FlightId int = 31172;
+#DECLARE Market string = "en-US";
+
+#DECLARE Outpath string = String.Format("/local/AdsOI/SERP/MV/{0}/{1:D2}", @StartTimeUtc.Year, @StartTimeUtc.Month);
+#DECLARE LogDate string = @StartTimeUtc.ToString("yyyy-MM-dd");
+
+MonetizationView = VIEW "/shares/adCenter.BICore.SubjectArea/SubjectArea/Monetization/views/PROD/MonetizationFacts.view"
+    PARAMS 
+    (
+        StartDateTimeUtc = @StartTimeUtc,
+        EndDateTimeUtc = @EndTimeUtc,
+
+        ReadAdImpressions  = true,
+        ReadClicks         = false,
+        ReadPageViews      = false,
+        ReadConversions    = false,
+        ReadSessions       = false,
+        UnpivotAdExtension = true,
+        UnpivotAdExtensionItem = true,
+    );
+
+MVData =
+    SELECT
+        RGUID,
+        SearchIG,
+        PagePosition,
+        AdId,
+        (ulong?) OrderItemId AS ListingId,
+        (ulong?) OfferId64 AS OfferId64,
+
+        IsFraud,
+        AdDisplayTypeId,
+        MarketplaceClassificationId,
+        CampaignId,
+        AdvertiserAccountId,
+        CustomerId,
+        Converter.ParseFlightNumber(FlightInfoRecordList, @FltNumberLine) AS FlightId,
+        IF(string.IsNullOrEmpty(AdLanguage) || string.IsNullOrEmpty(WebsiteCountry), null, AdLanguage + "-" + WebsiteCountry) AS Market,
+
+        MBDate AS UtcTime,
+        AdExtensionTypeId,
+        MarketplaceClassificationName,
+        ImpressionCnt,
+
+        ScopeArray.Create(ARRAY_AGG(ImpressionCnt > 0 ? AdExtensionTypeId : (short?)null).Where(e => e.HasValue).Select(e => e.Value)) AS DecorTypeIds
+    FROM MonetizationView
+    ;
+
+MVData =
+    SELECT
+        RGUID,
+        SearchIG,
+        PagePosition,
+        AdId,
+        ListingId,
+        OfferId64,
+        UtcTime,
+        UtcTime.HasValue? TimeZoneInfo.ConvertTimeFromUtc(UtcTime.Value, TimeZoneInfo.FindSystemTimeZoneById("Pacific Standard Time")) : (DateTime?) null AS PstTime,
+        AdExtensionTypeId,
+        MarketplaceClassificationName,
+        ImpressionCnt,
+        DecorTypeIds
+    FROM MVData
+    WHERE IsFraud == false
+        AND AdDisplayTypeId == 5                // ProductAd
+        AND MarketplaceClassificationId == 1    // Bing.com exclude Bing.com/images
+        AND CampaignId > 0
+        AND AdvertiserAccountId > 0
+        AND CustomerId > 0
+        AND AdId != NULL
+        AND ListingId != NULL
+        AND FlightId == @FlightId
+        AND !String.IsNullOrEmpty(Market) AND Market.Equals(@Market, StringComparison.OrdinalIgnoreCase)
+        AND (PagePosition.StartsWith("ML") OR PagePosition.StartsWith("SB") OR PagePosition.StartsWith("PO") OR PagePosition.StartsWith("MD"))
+    ;
+
+#DECLARE MVDataOutput string = String.Format("{0}/MVRaw_{1}.ss", @Outpath, @LogDate);
+OUTPUT MVData TO SSTREAM @MVDataOutput CLUSTERED BY UtcTime SORTED BY UtcTime WITH STREAMEXPIRY "90";
+
+DecorFlatten =
+    SELECT
+        RGUID,
+        SearchIG,
+        PagePosition,
+        AdId,
+        ListingId,
+        OfferId64,
+        UtcTime,
+        AdExtensionTypeId,
+        MarketplaceClassificationName,
+        ImpressionCnt,
+        DecorTypeIds.Contains(52) ? 1 : 0 AS Decor_MerchantPromotion_Impr, // SpecialOffer
+        DecorTypeIds.Contains(56) ? 1 : 0 AS Decor_LocalInventoryExtension_Impr,
+        DecorTypeIds.Contains(16135) ? 1 : 0 AS Decor_ConditionAnnotation_Impr, // Refurbished
+        DecorTypeIds.Contains(16250) ? 1 : 0 AS Decor_EliteBadge_Impr, // MerchantRating
+        DecorTypeIds.Contains(16251) ? 1 : 0 AS Decor_PriceDropAlert_Impr,
+        DecorTypeIds.Contains(16252) ? 1 : 0 AS Decor_ProductRating_Impr,
+        DecorTypeIds.Contains(16253) ? 1 : 0 AS Decor_FreeShipping_Impr,
+        //DecorTypeIds.Contains(16254) ? 1 : 0 AS Decor_ThreeDimensionalProductAds_Impr, // ImageOverlay
+        //DecorTypeIds.Contains(16257) ? 1 : 0 AS Decor_BrandLoyalty_Impr,
+        DecorTypeIds.Contains(16260) ? 1 : 0 AS Decor_AttributeAnnotation_Impr, // TopSold
+        DecorTypeIds.Contains(16262) ? 1 : 0 AS Decor_TopVisitedAnnotation_Impr // TopViewed
+        //DecorTypeIds.Contains(16264) ? 1 : 0 AS Decor_PAVisitedLinksAnnotation_Impr,
+        //DecorTypeIds.Contains(16268) ? 1 : 0 AS Decor_PriceDropAlertBadge_Impr,
+        //DecorTypeIds.Contains(16270) ? 1 : 0 AS Decor_FreeReturns_Impr,
+        //DecorTypeIds.Contains(16271) ? 1 : 0 AS Decor_SaleBadge_Impr,
+        //DecorTypeIds.Contains(16272) ? 1 : 0 AS Decor_SaleExtension_Impr,
+        //DecorTypeIds.Contains(16273) ? 1 : 0 AS Decor_PAShortTitle_Impr,
+        //DecorTypeIds.Contains(16275) ? 1 : 0 AS Decor_PAImageAnnotation_Impr,
+        //DecorTypeIds.Contains(16277) ? 1 : 0 AS Decor_AddToCart_Impr,
+        //DecorTypeIds.Contains(16278) ? 1 : 0 AS Decor_PABusinessAttributes_Impr
+    FROM MVData
+    ;
+
+#DECLARE DecorDataOutput string = String.Format("{0}/MVDecors_{1}.ss", @Outpath, @LogDate);
+OUTPUT DecorFlatten TO SSTREAM @DecorDataOutput CLUSTERED BY UtcTime SORTED BY UtcTime WITH STREAMEXPIRY "90";
+
+// ----------------------------------------------------------------------------------------------------------------------
+#CS
+using Microsoft.SCOPE.Types;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using ScopeRuntime;
+
+public static class Converter
+{
+    public static string ParseFlightInfoRecordList(string FlightInfoRecordList, string LineID)
+    {
+        if (string.IsNullOrEmpty(FlightInfoRecordList))
+            return (string)null;
+        string str1 = "";
+        int num = FlightInfoRecordList.IndexOf(LineID + "|");
+        if (num > -1)
+        {
+            string str2 = FlightInfoRecordList.Substring(num + LineID.Length + 1);
+            if (str2.IndexOf("|") > -1)
+                str1 = str2.Substring(0, str2.IndexOf("|"));
+        }
+        return str1;
+    }
+
+    public static int? ParseFlightNumber(string FlightInfoRecordList, string LineID)
+    {
+        string flightInfoRecordList = ParseFlightInfoRecordList(FlightInfoRecordList, LineID);
+        int result = -1;
+        return int.TryParse(flightInfoRecordList, out result) ? new int?(result) : new int?();
+    }
+}
+#ENDCS

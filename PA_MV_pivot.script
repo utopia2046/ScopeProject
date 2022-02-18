@@ -1,0 +1,126 @@
+﻿//Script GUID:eebfe97d-40b9-443e-9229-5496077c6f1a
+//Used for tracking history
+#DECLARE StartDateTimeUtc DateTime = DateTime.Parse(@@JOB_Date@@);
+#DECLARE EndDateTimeUtc DateTime = @StartDateTimeUtc.AddDays(1);
+
+#DECLARE ScopeUtilDll string = @"/shares/bingads.algo.adsplus/AdsPlusDataShare/Team/Resources/AdPredictor.ScopeUtils.dll";
+USING Microsoft.AdPredictor.ScopeUtils REFERENCE @ScopeUtilDll;
+
+#DECLARE FltNumberLine string = @"AdsFLN4";
+#DECLARE FlightId string = @"31172";
+#DECLARE Market string = "en-US";
+#DECLARE Outpath string = String.Format("/local/AdsOI/SERP/MV/{0}/{1:D2}", @StartDateTimeUtc.Year, @StartDateTimeUtc.Month);
+#DECLARE FilenameExt string = @FltNumberLine; // + "-" + @FlightId + "-" + @Market;
+#DECLARE LogDate string = @StartDateTimeUtc.ToString("yyyy-MM-dd");
+#DECLARE MVDataOuput string = String.Format("{0}/MVData_PA_{1}_{2}.ss", @Outpath, @FilenameExt, @LogDate);
+#DECLARE MVStatOuput string = String.Format("{0}/MVStat_PA_{1}_{2}.ss", @Outpath, @FilenameExt, @LogDate);
+
+MonetizationView = VIEW "/shares/adCenter.BICore.SubjectArea/SubjectArea/Monetization/views/PROD/MonetizationFacts.view"
+    PARAMS 
+    (
+        StartDateTimeUtc = @StartDateTimeUtc,
+        EndDateTimeUtc = @EndDateTimeUtc,
+
+        LoadDlls = true,
+
+        UnpivotAdExtensionItem = false,
+        UnpivotAdExtension = false,
+        UnpivotAdElement = false,
+
+        ReadClicks = true,
+        ReadAdImpressions = true,
+        ReadPageViews = true
+    );
+
+MonetizationOriginalData =
+    SELECT RGUID AS Rguid,
+           SearchIG,
+           (ulong?) AdId AS AdId,
+           (ulong?) OrderItemId AS ListingId,
+           (ulong?) OfferId64 AS OfferId64,
+
+           ImpressionCnt,
+           ClickCnt,
+           AmountChargedUSDMonthlyExchangeRt AS Revenue,
+
+           PagePosition,
+           IsFraud,
+           AdDisplayTypeId,
+           MarketplaceClassificationId,
+
+           AdExtensionTypeId,
+           AdExtensionId,
+           AdExtensionItemId,
+
+           (uint?) CampaignTypeId AS CampaignTypeId,
+           IsMB,
+           IsMI,
+           MBTime,
+           MITime,
+           Utils.MVGetFlightNum(FlightInfoRecordList, @FltNumberLine) AS FlightNum,
+           IF(string.IsNullOrEmpty(AdLanguage) || string.IsNullOrEmpty(WebsiteCountry), null, AdLanguage + "-" + WebsiteCountry) AS Market
+    FROM MonetizationView;
+
+MonetizationPAData =
+    SELECT *
+    FROM MonetizationOriginalData
+    WHERE
+        (IsFraud == false) AND
+        (AdDisplayTypeId == 5) AND               // PA
+        (MarketplaceClassificationId == 1) AND   // Bing.com exclude Bing.com/images
+//        FlightNum == ("" + @FlightId),      // 31172 is control flight
+//        !string.IsNullOrEmpty(Market) AND Market.Equals(@Market.ToLower(), StringComparison.OrdinalIgnoreCase), // en-us only
+        (PagePosition.StartsWith("ML") OR PagePosition.StartsWith("SB") OR PagePosition.StartsWith("PO") OR PagePosition.StartsWith("MD"))
+    ;
+
+OUTPUT MonetizationPAData
+TO SSTREAM @MVDataOuput
+CLUSTERED BY Rguid
+SORTED BY Rguid
+WITH STREAMEXPIRY "90";
+
+MonetizationPADistinctData =
+    SELECT DISTINCT Rguid,
+                    SearchIG,
+                    PagePosition,
+                    AdId,
+                    ListingId,
+                    OfferId64,
+                    AdExtensionTypeId,
+                    FlightNum,
+                    Market,
+                    CampaignTypeId,
+                    IsMB,
+                    IsMI,
+                    ImpressionCnt,
+                    ClickCnt,
+                    Revenue
+    FROM MonetizationPAData;
+
+PAMVPStat =
+    SELECT
+        @LogDate AS LogDate,
+        PagePosition,
+//        AdExtensionTypeId,
+        FlightNum,
+        Market,
+//        CampaignTypeId,
+        IsMB,
+        IsMI,
+        SUM(ImpressionCnt) AS TotalImpressions,
+        SUM(ClickCnt) AS TotalClicks,
+        SUM(Revenue) AS TotalRevenue
+    FROM MonetizationPADistinctData
+    GROUP BY
+        LogDate,
+        PagePosition,
+//        AdExtensionTypeId,
+        FlightNum,
+        Market,
+//        CampaignTypeId,
+        IsMB,
+        IsMI
+    ;
+
+OUTPUT PAMVPStat
+TO SSTREAM @MVStatOuput WITH STREAMEXPIRY "180";

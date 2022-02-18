@@ -1,0 +1,110 @@
+﻿//Script GUID:a270236c-eb98-4141-8b26-6245ee08b1b0
+//Used for tracking history
+
+REFERENCE @"/local/AdsOI/SERP/Bin/Microsoft.Search.PerformancePipelineUtilities.dll";
+
+USING Microsoft.Search.PerformancePipelineUtilities;
+USING System.Globalization;
+
+#DECLARE StartDateTime DateTime = DateTime.Parse("2022-01-12");
+#DECLARE EndDateTime DateTime = @StartDateTime.AddDays(1);
+#DECLARE DateFormat string = @"yyyy-MM-dd";
+#DECLARE LogDateString string = @StartDateTime.ToString(@DateFormat);
+
+#DECLARE TreatmentLine string = @"AdsFLN4";
+#DECLARE TreatmentID string = @"145705";
+#DECLARE ControlLine string = @"AdsFLN4";
+#DECLARE ControlID string = @"145754";
+
+#DECLARE OutputPath string = String.Format("/local/AdsOI/SERP/SLAPI/{0}/{1:D2}", @StartDateTime.Year, @StartDateTime.Month);
+
+#DECLARE TreatmentFlight string = string.Format("|{0}:{1}|", @TreatmentLine, @TreatmentID).ToLowerInvariant();
+#DECLARE ControlFlight string = string.Format("|{0}:{1}|", @ControlLine, @ControlID).ToLowerInvariant();
+
+#DECLARE StreamExpiry string = "90";
+
+// Define Bing SLAPI view
+BingSlapiPageView =
+    VIEW "/shares/searchDM/distrib/released/SLAPI/SearchLogPageView.view"
+    PARAMS
+    (
+        Start = @StartDateTime.ToString(@DateFormat),
+        End = @EndDateTime.ToString(@DateFormat),
+        UseSample = false,
+        ReturnAbnormalTraffic = false,
+        Dataset = "Bing.com"
+    );
+ 
+// Select Raw Bing Data
+RawBingData =
+    SELECT
+        Request_ImpressionGuid AS ImpressionGuid,
+        Request_RequestTime,
+        ((Request_DataCenter?? "")).ToLower() AS BingDataCenter,
+        ClientId,
+        Dataset,
+        Query_RawQuery,
+        Request_OSInfo.Platform AS OS,
+        Market,
+        Vertical,
+        DataSources.FindElementsWithProperty("T", "D.Top.AdsDomain.AdCenter")[0].GetDataPropertyOrDefault("TrueService", "nothing") AS TrueService,
+        DataSources.FindElementsWithProperty("T", "D.Top.AdsDomain.AdCenter")[0].GetDataPropertyOrDefault("RequestId", "") AS RGUID,
+        DataSources.FindElementsWithProperty("T", "D.Top.AdsDomain.AdCenter")[0].GetDataPropertyOrDefault("AdsFlights", "") AS AdsFlights,
+        
+        // TextAds Latency
+        DataSources.WhereElementHasChildWithProperty("T", "D.QueryProfileData").FindElementsWithProperty("NodeAlias", "baseAds.AdServiceWithDependencies.textAds.keywordRequest")[0].GetDataPropertyOrDefault("EndTimeMS", "-1") AS TA_Start,
+        DataSources.WhereElementHasChildWithProperty("T", "D.QueryProfileData").FindElementsWithProperty("NodeAlias", "baseAds.AdServiceWithDependencies.textAds.adsfdResponseExtractor")[0].GetDataPropertyOrDefault("StartTimeMS", "-1") AS TA_End,
+        DataSources.WhereElementHasChildWithProperty("T", "D.Top.AdsDomain.AdCenter").FindElementsWithProperty("Provider", "AdCenter")[0].GetDataPropertyOrDefault("Latency", "-1")           AS TAdBackendLatency,
+        
+        // ProductAds Latency   
+        DataSources.WhereElementHasChildWithProperty("T", "D.QueryProfileData").FindElementsWithProperty("NodeAlias", "baseAds.PLAMain.modifiedOfferSelection.sendRequest")[0].GetDataPropertyOrDefault("EndTimeMS", "-1") AS PA_Start,
+        DataSources.WhereElementHasChildWithProperty("T", "D.QueryProfileData").FindElementsWithProperty("NodeAlias", "baseAds.PLAMain.modifiedOfferSelection.receiveResponse")[0].GetDataPropertyOrDefault("StartTimeMS", "-1") AS PA_End,
+        DataSources.WhereElementHasChildWithProperty("T", "D.Top.AdsDomain.AdCenter").FindElementsWithProperty("Provider", "AdCenter")[0].GetDataPropertyOrDefault("ProductAdsLatency", "-1") AS PABackendLatency,        
+        
+        // PostAds
+        DataSources.WhereElementHasChildWithProperty("T", "D.QueryProfileData").FindElementsWithProperty("NodeAlias", "baseAds.arg.arg.join")[0].GetDataPropertyOrDefault("EndTimeMS", "-1") AS PostAds_End,
+        
+        // Workflow
+        DataSources.WhereElementHasChildWithProperty("T", "D.QueryProfileData").FindElementsWithProperty("ExperimentName", "SharedProd")[0].GetDataPropertyOrDefault("WorkflowName", "") AS WorflowName,
+        
+        // XAP Latency
+        DataSources.WhereElementHasChildWithProperty("T", "D.QueryProfileData").FindElementsWithProperty("WorkflowName", "Xap.BingFirstPageResults")[0].GetDataPropertyOrDefault("LatencyMS", "-1") AS ATLALatencyByATLA
+        
+    FROM
+        BingSlapiPageView
+    HAVING TrueService == "AdResponseGenAnswer";
+
+RawBingFlightData =
+    SELECT *,
+        AdsFlights.ToLower().Contains(@TreatmentFlight) AS IsTreatment,
+        AdsFlights.ToLower().Contains(@ControlFlight) AS IsControl
+    FROM 
+        RawBingData;
+
+// Get query profile data for BingFirstPageResults (possibly this should be added as FSC optional parameter)
+GetQueryProfileData =
+    SELECT *
+    FROM 
+        RawBingFlightData
+    WHERE IsTreatment OR IsControl;
+
+#DECLARE OutputProfile string = String.Format("{0}/QueryProfile_{1}.ss", @OutputPath, @LogDateString);
+OUTPUT GetQueryProfileData TO SSTREAM @OutputProfile WITH STREAMEXPIRY @StreamExpiry;
+
+// Extract the component start and end times so that individual latencies can be computed
+MarkerExtraction =
+    SELECT *,
+        MetricMath.ToInt(ATLALatencyByATLA) AS XAPLatency,
+        MetricMath.ToInt(TA_Start) AS Metrics_TA_Start,
+        MetricMath.ToInt(TA_End) AS Metrics_TA_End,
+        MetricMath.ToInt(TAdBackendLatency) AS TextAdsBackendLatency,
+        MetricMath.ToInt(PA_Start) AS Metrics_PA_Start,
+        MetricMath.ToInt(PA_End) AS Metrics_PA_End,
+        MetricMath.ToInt(PABackendLatency) AS ProductsAdsBackendLatency,
+        MetricMath.ToInt(PostAds_End) AS Metrics_PostAds_End
+    FROM GetQueryProfileData
+    WHERE
+        IsTreatment OR IsControl;
+
+#DECLARE OutputMarker string = String.Format("{0}/MarkerExtraction_{1}.ss", @OutputPath, @LogDateString);
+OUTPUT MarkerExtraction TO SSTREAM @OutputMarker WITH STREAMEXPIRY @StreamExpiry;
